@@ -1,21 +1,34 @@
+// A run-scoped update (one carrying runId) only lands while that run is still downloading,
+// so a late "done" can never overwrite "cancelled". Card updates without runId never
+// interrupt an active download. `start: true` begins a new run.
+export function nextJob(prev, partial, now = Date.now()) {
+  const current = prev || {};
+  const { start, ...patch } = partial;
+  if (!start) {
+    if (patch.runId) {
+      if (current.runId !== patch.runId || current.phase !== "downloading") return null;
+    } else if (current.phase === "downloading") {
+      return null;
+    }
+  }
+  return { ...current, ...patch, updatedAt: now };
+}
+
 export async function readJob() {
   const stored = await chrome.storage.session.get("job");
   return stored.job || null;
 }
 
-export async function publishJob(partial) {
-  const prev = await readJob() || {};
-  if (partial.progress) {
-    if (prev.phase !== "downloading") return prev;
-    if (partial.runId && prev.runId && String(prev.runId) !== String(partial.runId)) return prev;
-  } else if (prev.phase === "downloading" && ["inspecting", "ready", "blocked"].includes(partial.phase)) {
-    return prev;
-  }
-  const job = { ...prev, ...partial, updatedAt: Date.now() };
-  delete job.progress;
-  await chrome.storage.session.set({ job });
-  chrome.runtime.sendMessage({ type: "job", job }).catch(() => {
-    // 页面没打开，或上一条消息还没返回时，广播可能发不出去。
+let queue = Promise.resolve();
+
+export function publishJob(partial) {
+  const run = queue.then(async () => {
+    const prev = await readJob();
+    const job = nextJob(prev, partial);
+    if (!job) return prev;
+    await chrome.storage.session.set({ job });
+    return job;
   });
-  return job;
+  queue = run.catch(() => {});
+  return run;
 }

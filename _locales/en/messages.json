@@ -1,0 +1,5 @@
+{
+  "extName": { "message": "X Space Downloader" },
+  "extDescription": { "message": "Check X Space replays and save the recording as an audio file." },
+  "actionTitle": { "message": "Download X Space recording" }
+}

@@ -1,9 +1,4 @@
-const HOSTS = new Set([
-  "x.com",
-  "twitter.com",
-  "mobile.x.com",
-  "mobile.twitter.com",
-]);
+const HOSTS = new Set(["x.com", "twitter.com", "mobile.x.com", "mobile.twitter.com"]);
 
 export function spaceIdFromText(value) {
   if (!value) return null;

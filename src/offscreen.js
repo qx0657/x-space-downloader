@@ -1,179 +1,140 @@
-import { asSpaceError } from "./lib/errors.js";
-import { baseNameOf } from "./lib/format.js";
-import { downloadRecording } from "./lib/hls.js";
-import { deletePendingFile, readPendingFile } from "./lib/idb-file.js";
-import { publishJob } from "./lib/job.js";
+import { asSpaceError, SpaceError } from "./lib/errors.js";
+import { deviceConcurrency, downloadRecording } from "./lib/hls.js";
+import { t } from "./lib/i18n.js";
+import { fetchWithTimeout, isAllowedMediaUrl } from "./lib/net.js";
+import { createTsRemuxer } from "./lib/remux.js";
+import { cleanupOpfsStores, createOpfsStore, removeOpfsStore } from "./lib/store.js";
 
-let controller = null;
-let lastProgressAt = 0;
-let progressTimer = null;
-let pendingProgress = null;
+const STALE_RUN_MS = 7 * 24 * 3600 * 1000;
+const PROGRESS_INTERVAL_MS = 300;
 
-function progressMessage(progress) {
-  if (progress.phase === "mux") return "分片已下完，正在合成音频…";
-  if (progress.phase === "playlist") return "正在读取播放列表…";
-  const total = progress.total || 0;
-  const completed = progress.completed || 0;
-  if (!total) return "正在下载…";
-  const pct = Math.max(completed ? 1 : 0, Math.min(99, Math.round((100 * completed) / total)));
-  if (!completed) return `正在下载 0/${total}`;
-  return `正在下载 ${completed}/${total} · ${pct}%`;
+let active = null;
+const finished = new Map();
+
+function send(message) {
+  return chrome.runtime.sendMessage(message).catch(() => null);
 }
 
-function queueProgress(prepared, progress) {
-  pendingProgress = progress;
+function progressReporter(runId) {
+  let last = 0;
+  let timer = null;
+  let pending = null;
   const flush = () => {
-    progressTimer = null;
-    lastProgressAt = Date.now();
-    const current = pendingProgress;
-    if (!current) return;
-    const patch = {
-      progress: true,
-      phase: "downloading",
-      runId: prepared.runId,
-      spaceId: prepared.spaceId,
-      completed: current.completed || 0,
-      detail: current.phase,
-      message: progressMessage(current),
-    };
-    if (current.total) patch.total = current.total;
-    publishJob(patch).catch(() => {});
+    timer = null;
+    last = Date.now();
+    if (pending) send({ type: "offscreen-progress", runId, progress: pending });
+    pending = null;
   };
-  const now = Date.now();
-  if (progress.phase !== "segment" || now - lastProgressAt >= 300) {
-    if (progressTimer) {
-      clearTimeout(progressTimer);
-      progressTimer = null;
+  const report = (progress) => {
+    pending = progress;
+    const urgent = progress.phase !== "segment" && progress.phase !== "mux";
+    if (urgent || Date.now() - last >= PROGRESS_INTERVAL_MS) {
+      clearTimeout(timer);
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(flush, PROGRESS_INTERVAL_MS);
     }
-    flush();
-    return;
-  }
-  if (!progressTimer) progressTimer = setTimeout(flush, 300);
+  };
+  report.stop = () => clearTimeout(timer);
+  return report;
 }
 
-function waitForDownload(id) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (ok, error) => {
-      if (settled) return;
-      settled = true;
-      chrome.downloads.onChanged.removeListener(onChanged);
-      if (ok) resolve();
-      else reject(error);
-    };
-    const onChanged = (delta) => {
-      if (delta.id !== id) return;
-      if (delta.state?.current === "complete") finish(true);
-      if (delta.state?.current === "interrupted") {
-        finish(false, new Error(delta.error?.current || "浏览器取消了保存"));
-      }
-    };
-    chrome.downloads.onChanged.addListener(onChanged);
-    chrome.downloads.search({ id }).then(([item]) => {
-      if (item?.state === "complete") finish(true);
-      if (item?.state === "interrupted") finish(false, new Error(item.error || "浏览器取消了保存"));
-    });
-  });
-}
-
-async function saveFile(bytes, filename, mime) {
-  const url = URL.createObjectURL(bytes instanceof Blob ? bytes : new Blob([bytes], { type: mime }));
+async function fetchCover(url, signal) {
+  if (!url || !isAllowedMediaUrl(url)) return null;
   try {
-    const downloadId = await chrome.downloads.download({
-      url,
-      filename,
-      saveAs: false,
-      conflictAction: "uniquify",
-    });
-    await waitForDownload(downloadId);
-    const [item] = await chrome.downloads.search({ id: downloadId });
-    return item?.filename || filename;
-  } finally {
-    URL.revokeObjectURL(url);
+    const response = await fetchWithTimeout(url, { signal, credentials: "omit" }, 8000);
+    if (!response.ok) return null;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return { bytes, type: "jpeg" };
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) return { bytes, type: "png" };
+  } catch {
+    // 封面拿不到不影响录音本身。
   }
+  return null;
 }
 
-async function savePendingFile(filename) {
-  const blob = await readPendingFile();
-  if (!blob) throw new Error("没有找到已合成的录音");
-  const saved = await saveFile(blob, filename, blob.type || "audio/mp4");
-  await deletePendingFile();
-  return saved;
+async function refreshMedia(runId) {
+  const response = await send({ type: "offscreen-refresh", runId });
+  if (!response?.ok || !response.mediaUrl) throw new SpaceError("expired", response?.error || t("replayUrlExpired"));
+  return response.mediaUrl;
 }
 
 async function start(prepared) {
-  if (controller) return;
-  controller = new AbortController();
+  const controller = new AbortController();
+  const report = progressReporter(prepared.runId);
+  active = { runId: prepared.runId, controller };
   try {
+    await cleanupOpfsStores(STALE_RUN_MS, prepared.storeKey).catch(() => {});
+    const store = await createOpfsStore(prepared.storeKey);
+    const metadata = prepared.metadata
+      ? { ...prepared.metadata, cover: await fetchCover(prepared.metadata.coverUrl, controller.signal) }
+      : null;
+    const Transmuxer = globalThis.muxjs?.Transmuxer;
     const file = await downloadRecording(prepared.mediaUrl, {
       mode: prepared.mode,
       signal: controller.signal,
-      onProgress: (progress) => queueProgress(prepared, progress),
+      store,
+      metadata,
+      limits: deviceConcurrency(navigator, prepared.maxConcurrency),
+      createRemuxer: prepared.videoFormat === "mp4" && Transmuxer ? () => createTsRemuxer(Transmuxer) : null,
+      refreshMedia: () => refreshMedia(prepared.runId),
+      onProgress: report,
     });
-    const filename = `X-Spaces/${prepared.baseName}.${file.extension}`;
-    const savedPath = await saveFile(file.bytes, filename, file.mime);
-    const visibleName = baseNameOf(savedPath) || `${prepared.baseName}.${file.extension}`;
-    await publishJob({
-      phase: "done",
+    report.stop();
+    const url = URL.createObjectURL(file.blob);
+    finished.set(prepared.runId, { url, storeKey: prepared.storeKey });
+    await send({
+      type: "offscreen-file",
       runId: prepared.runId,
-      spaceId: prepared.spaceId,
-      message: "已保存到下载文件夹",
-      savedPath,
-      filename: visibleName,
-      completed: file.segmentCount,
-      total: file.segmentCount,
+      url,
+      extension: file.extension,
       durationSeconds: file.durationSeconds,
+      segmentCount: file.segmentCount,
+      size: file.blob.size,
     });
-    try {
-      chrome.notifications.create(`space-${prepared.spaceId}-${Date.now()}`, {
-        type: "basic",
-        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
-        title: prepared.mode === "video" ? "Space 视频已保存" : "Space 录音已保存",
-        message: visibleName,
-      });
-    } catch {
-      // 通知失败不影响已经保存的文件。
-    }
   } catch (error) {
+    report.stop();
     const wrapped = asSpaceError(error);
-    await publishJob({
-      phase: wrapped.code === "cancelled" ? "cancelled" : "error",
-      runId: prepared.runId,
-      spaceId: prepared.spaceId,
-      message: wrapped.message,
-      audioMediaUrl: "",
-      videoMediaUrl: "",
-    });
+    await send({ type: "offscreen-error", runId: prepared.runId, code: wrapped.code, message: wrapped.message });
   } finally {
-    if (progressTimer) clearTimeout(progressTimer);
-    progressTimer = null;
-    pendingProgress = null;
-    controller = null;
+    active = null;
+  }
+}
+
+async function finishRun(runId, success) {
+  const entry = finished.get(runId);
+  if (entry) {
+    URL.revokeObjectURL(entry.url);
+    finished.delete(runId);
+    if (success) await removeOpfsStore(entry.storeKey);
   }
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "offscreen-ping") {
-    sendResponse({ ready: true, running: Boolean(controller) });
-    return true;
+  switch (message?.type) {
+    case "offscreen-ping":
+      sendResponse({ ready: true, running: Boolean(active), runId: active?.runId || null });
+      return false;
+    case "download-start":
+      if (active) {
+        sendResponse({ ok: false, error: t("busyGeneric") });
+        return false;
+      }
+      start(message.prepared);
+      sendResponse({ ok: true });
+      return false;
+    case "download-cancel":
+      if (!message.runId || active?.runId === message.runId) active?.controller.abort();
+      finishRun(message.runId, false);
+      sendResponse({ ok: true });
+      return false;
+    case "finish-run":
+      finishRun(message.runId, Boolean(message.success)).then(
+        () => sendResponse({ ok: true }),
+        () => sendResponse({ ok: false }),
+      );
+      return true;
+    default:
+      return false;
   }
-  if (message?.type === "download-cancel") {
-    controller?.abort();
-    sendResponse({ ok: true });
-    return true;
-  }
-  if (message?.type === "save-file") {
-    savePendingFile(message.filename)
-      .then((saved) => sendResponse({ ok: true, filename: saved }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || "保存失败" }));
-    return true;
-  }
-  if (message?.type === "download-start") {
-    sendResponse({ ok: true });
-    start(message.prepared).catch((error) => {
-      publishJob({ phase: "error", message: asSpaceError(error).message }).catch(() => {});
-    });
-    return true;
-  }
-  return false;
 });

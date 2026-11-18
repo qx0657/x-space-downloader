@@ -1,36 +1,49 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>X Space 录音</title>
-  <link rel="stylesheet" href="popup.css">
-</head>
-<body>
-  <header>
-    <img src="../icons/icon48.png" width="28" height="28" alt="">
-    <div>
-      <h1>X Space 录音</h1>
-      <p>把回放保存成音频文件</p>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title data-i18n="appName"></title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <img src="../icons/icon48.png" width="28" height="28" alt="" />
+      <div>
+        <h1 data-i18n="appName"></h1>
+        <p data-i18n="tagline"></p>
+      </div>
+    </header>
+    <label for="url" data-i18n="spaceLink"></label>
+    <div class="row">
+      <input id="url" type="url" placeholder="https://x.com/i/spaces/…" spellcheck="false" autocomplete="off" />
+      <button id="inspect" type="button" data-i18n="inspect"></button>
     </div>
-  </header>
-  <label for="url">Space 链接</label>
-  <div class="row">
-    <input id="url" type="url" placeholder="https://x.com/i/spaces/…" spellcheck="false" autocomplete="off">
-    <button id="inspect" type="button">解析</button>
-  </div>
-  <section id="card" hidden>
-    <h2 id="title"></h2>
-    <p id="meta"></p>
-    <p id="time"></p>
-    <div class="actions">
-      <button id="download" type="button">下载录音</button>
-      <button id="video" type="button" hidden>下载视频</button>
-      <button id="cancel" type="button" hidden>取消</button>
-    </div>
-    <div class="bar" id="bar" hidden><span id="bar-fill"></span></div>
-  </section>
-  <p id="message" role="status"></p>
-  <footer>文件保存在“下载 / X-Spaces”</footer>
-  <script type="module" src="popup.js"></script>
-</body>
+    <section id="card" hidden aria-live="polite">
+      <h2 id="title"></h2>
+      <p id="meta"></p>
+      <p id="time"></p>
+      <div class="actions">
+        <button id="download" type="button" data-i18n="downloadAudio"></button>
+        <button id="video" type="button" hidden data-i18n="downloadVideo"></button>
+        <button id="cancel" type="button" hidden data-i18n="cancel"></button>
+      </div>
+      <div
+        class="bar"
+        id="bar"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        data-i18n-label="progress"
+        hidden
+      >
+        <span id="bar-fill"></span>
+      </div>
+    </section>
+    <p id="message" role="status" aria-live="polite"></p>
+    <footer>
+      <span id="folder"></span>
+      <button id="options" class="link" type="button" data-i18n="settings"></button>
+    </footer>
+    <script type="module" src="popup.js"></script>
+  </body>
 </html>

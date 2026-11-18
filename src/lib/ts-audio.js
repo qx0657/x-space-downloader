@@ -1,5 +1,6 @@
 import { SpaceError } from "./errors.js";
 import { concat } from "./bytes.js";
+import { t } from "./i18n.js";
 
 const PACKET = 188;
 
@@ -55,7 +56,7 @@ function stripPes(packet) {
 
 export function extractAdtsFromTs(data) {
   if (data.length < PACKET || data[0] !== 0x47) {
-    throw new SpaceError("audio", "视频分片不是 MPEG-TS");
+    throw new SpaceError("audio", t("tsNotMpegTs"));
   }
   let pmtPid = null;
   let audio = null;
@@ -94,10 +95,10 @@ export function extractAdtsFromTs(data) {
   }
   if (current.length) elementary.push(stripPes(concat(current)));
   if (!elementary.length) {
-    throw new SpaceError("audio", "没有在视频回放里找到音轨");
+    throw new SpaceError("audio", t("tsNoAudio"));
   }
   if (audio?.latm) {
-    throw new SpaceError("audio", "这条视频回放的音频封装暂时抽不出来，可以改下载视频");
+    throw new SpaceError("audio", t("tsLatm"));
   }
   return concat(elementary);
 }

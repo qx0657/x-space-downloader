@@ -1,0 +1,92 @@
+:root {
+  color-scheme: light dark;
+  --fg: #0f1419;
+  --muted: #536471;
+  --line: #cfd9de;
+  --field: #fff;
+  --accent: #1d9bf0;
+  font:
+    14px/1.5 "Segoe UI",
+    "PingFang SC",
+    "Noto Sans SC",
+    sans-serif;
+  color: var(--fg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e7e9ea;
+    --muted: #8b98a5;
+    --line: #2f3336;
+    --field: #000;
+  }
+}
+
+main {
+  max-width: 520px;
+  padding: 8px 4px 16px;
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0 0 16px;
+}
+
+form {
+  display: grid;
+  gap: 16px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+}
+
+label > span {
+  font-weight: 600;
+}
+
+label.check {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+label.check > span {
+  font-weight: 400;
+}
+
+input[type="text"],
+input[type="number"],
+select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+
+input[type="number"] {
+  width: 96px;
+}
+
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+small {
+  color: var(--muted);
+}
+
+#preview {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
+#status {
+  min-height: 1.5em;
+  color: #00ba7c;
+}

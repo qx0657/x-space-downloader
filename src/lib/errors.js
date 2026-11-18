@@ -1,3 +1,5 @@
+import { t } from "./i18n.js";
+
 export class SpaceError extends Error {
   constructor(code, message) {
     super(message);
@@ -8,6 +10,6 @@ export class SpaceError extends Error {
 
 export function asSpaceError(error) {
   if (error instanceof SpaceError) return error;
-  if (error?.name === "AbortError") return new SpaceError("cancelled", "已取消下载");
-  return new SpaceError("network", error?.message || "网络请求失败");
+  if (error?.name === "AbortError") return new SpaceError("cancelled", t("cancelled"));
+  return new SpaceError("network", error?.message || t("networkFailed"));
 }

@@ -1,3 +1,10 @@
+import { t } from "./i18n.js";
+
+export const DEFAULT_TEMPLATE = "{date} {handle} {title}";
+export const DEFAULT_FOLDER = "X-Spaces";
+
+const pad = (n) => String(n).padStart(2, "0");
+
 export function epochMs(value) {
   if (value == null || value === "") return null;
   const n = Number(value);
@@ -8,8 +15,7 @@ export function epochMs(value) {
 export function formatClock(ms) {
   if (ms == null) return "";
   const date = new Date(ms);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 export function formatDuration(seconds) {
@@ -18,9 +24,8 @@ export function formatDuration(seconds) {
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
-  const p = (n) => String(n).padStart(2, "0");
-  if (h > 0) return `${h}:${p(m)}:${p(s)}`;
-  return `${m}:${p(s)}`;
+  if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
+  return `${m}:${pad(s)}`;
 }
 
 export function formatBytes(bytes) {
@@ -31,34 +36,55 @@ export function formatBytes(bytes) {
 }
 
 export function stateLabel(state, replay) {
-  if (state === "Running") return "直播中";
-  if (state === "NotStarted") return "未开始";
+  if (state === "Running") return t("stateRunning");
+  if (state === "NotStarted") return t("stateNotStarted");
   if (state === "Ended" || state === "TimedOut") {
-    return replay ? "已结束 · 有回放" : "已结束 · 无回放";
+    return replay ? t("stateEndedReplay") : t("stateEndedNoReplay");
   }
-  return state || "未知状态";
+  return state || t("stateUnknown");
 }
 
-export function fileBase(info) {
+export function progressPercent(job) {
+  if (!job?.total) return 0;
+  if (job.phase === "done") return 100;
+  const completed = job.completed || 0;
+  if (!completed) return 0;
+  return Math.max(1, Math.min(99, Math.round((100 * completed) / job.total)));
+}
+
+export function fileBase(info, template = DEFAULT_TEMPLATE) {
   const when = info.startedAt ? new Date(info.startedAt) : new Date();
-  const p = (n) => String(n).padStart(2, "0");
-  const date = `${when.getFullYear()}-${p(when.getMonth() + 1)}-${p(when.getDate())}`;
-  const who = info.handle ? `@${info.handle}` : (info.creatorName || "space");
-  const title = info.title || info.spaceId || "space";
-  return sanitize(`${date} ${who} ${title}`).slice(0, 120);
+  const values = {
+    date: `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())}`,
+    time: `${pad(when.getHours())}${pad(when.getMinutes())}`,
+    handle: info.handle ? `@${info.handle}` : info.creatorName || "",
+    name: info.creatorName || "",
+    title: info.title || "",
+    id: info.spaceId || "",
+  };
+  const text = String(template || DEFAULT_TEMPLATE).replace(/\{(\w+)\}/g, (match, key) =>
+    key in values ? values[key] : match,
+  );
+  const name = sanitize(text, "").slice(0, 120).trim();
+  return name || sanitize(info.spaceId || "space");
 }
 
-export function sanitize(value) {
-  return String(value)
-    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim() || "space";
+export function sanitize(value, fallback = "space") {
+  return (
+    String(value)
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^\.+/, "") || fallback
+  );
 }
 
-export function audioSaveName(filename, mime = "") {
-  const audio = /audio\/(mp4|x-m4a|m4a)/i.test(mime) || /\.m4a$/i.test(filename);
-  if (!audio) return filename;
-  return String(filename).replace(/\.(mp4|m4a)$/i, "") + ".m4a";
+export function sanitizeFolder(folder) {
+  const parts = String(folder ?? "")
+    .split(/[\\/]+/)
+    .map((part) => sanitize(part, ""))
+    .filter((part) => part && part !== "." && part !== "..");
+  return parts.join("/");
 }
 
 export function baseNameOf(path) {

@@ -1,0 +1,23 @@
+{
+  "name": "x-space-downloader",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension that saves X Space replays as audio files.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:live": "LIVE=1 node --test test/*.test.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "vendor": "node scripts/vendor.mjs",
+    "package": "node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.15.0",
+    "globals": "^17.14.0",
+    "mux.js": "^6.3.0",
+    "prettier": "^3.10.1"
+  }
+}

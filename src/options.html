@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title data-i18n="settingsTitle"></title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1 data-i18n="settingsTitle"></h1>
+      <form id="form">
+        <label>
+          <span data-i18n="optFolder"></span>
+          <input name="folder" type="text" spellcheck="false" />
+          <small data-i18n="optFolderHint"></small>
+        </label>
+        <label>
+          <span data-i18n="optTemplate"></span>
+          <input name="template" type="text" spellcheck="false" />
+          <small data-i18n="optTemplateHint"></small>
+          <small id="preview" aria-live="polite"></small>
+        </label>
+        <label>
+          <span data-i18n="optVideoFormat"></span>
+          <select name="videoFormat">
+            <option value="mp4" data-i18n="optVideoMp4"></option>
+            <option value="ts" data-i18n="optVideoTs"></option>
+          </select>
+        </label>
+        <label>
+          <span data-i18n="optConcurrency"></span>
+          <input name="maxConcurrency" type="number" min="0" max="32" step="1" />
+          <small data-i18n="optConcurrencyHint"></small>
+        </label>
+        <label class="check">
+          <input name="embedMetadata" type="checkbox" />
+          <span data-i18n="optMetadata"></span>
+        </label>
+        <label class="check">
+          <input name="showPanel" type="checkbox" />
+          <span data-i18n="optShowPanel"></span>
+        </label>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

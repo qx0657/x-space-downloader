@@ -1,0 +1,6 @@
+node_modules/
+dist/
+src/vendor/
+_metadata/
+package-lock.json
+.impeccable/

@@ -1,19 +1,14 @@
 import { asSpaceError, SpaceError } from "./errors.js";
 import { fetchWithTimeout } from "./net.js";
-import { epochMs, fileBase } from "./format.js";
-import {
-  fetchText,
-  isAudioOnly,
-  mediaKind,
-  parsePlaylist,
-  resolveMedia,
-  selectPlaylistTarget,
-} from "./hls.js";
+import { epochMs } from "./format.js";
+import { apiLanguage, t } from "./i18n.js";
+import { fetchText, isAudioOnly, mediaKind, parsePlaylist, resolveMedia, selectPlaylistTarget } from "./hls.js";
 import { spacePageUrl } from "./space-url.js";
 
 // x.com 网页自己带的公开客户端令牌，不是用户密钥。
 // 登录身份只来自浏览器里的 auth_token / ct0。
-export const PUBLIC_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+export const PUBLIC_BEARER =
+  "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 export const DEFAULT_QUERY_ID = "zm3JmUpYWDXIUsf_33-ZrA";
 
 const FEATURES = {
@@ -34,7 +29,7 @@ function headersFor(session, extra = {}) {
     authorization: `Bearer ${PUBLIC_BEARER}`,
     accept: "*/*",
     "x-twitter-active-user": "yes",
-    "x-twitter-client-language": "zh-cn",
+    "x-twitter-client-language": apiLanguage(),
     ...extra,
   };
   if (session.mode === "user") {
@@ -57,19 +52,23 @@ async function apiFetch(session, url, options = {}) {
   const text = await response.text();
   if (!text) {
     const code = response.status === 401 || response.status === 403 ? "auth" : "http";
-    throw new SpaceError(code, `X 没有返回数据（${response.status}）`);
+    throw new SpaceError(code, t("apiEmpty", response.status));
   }
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    throw new SpaceError("http", `X 返回了无法解析的内容（${response.status}）`);
+    throw new SpaceError("http", t("apiBadJson", response.status));
   }
   if (!response.ok) {
-    const message = (json.errors || []).map((item) => item.message).filter(Boolean).join("；");
-    const staleQuery = /\/graphql\//.test(url) && /unknown operation|query not found|could not find operation/i.test(message);
-    const code = response.status === 401 || response.status === 403 ? "auth" : (staleQuery ? "query" : "http");
-    throw new SpaceError(code, message || `X 请求失败（${response.status}）`);
+    const message = (json.errors || [])
+      .map((item) => item.message)
+      .filter(Boolean)
+      .join("；");
+    const staleQuery =
+      /\/graphql\//.test(url) && /unknown operation|query not found|could not find operation/i.test(message);
+    const code = response.status === 401 || response.status === 403 ? "auth" : staleQuery ? "query" : "http";
+    throw new SpaceError(code, message || t("apiFailed", response.status));
   }
   return json;
 }
@@ -81,7 +80,7 @@ export async function activateGuest(signal) {
     headers: { "content-type": "application/json" },
     signal,
   });
-  if (!json.guest_token) throw new SpaceError("auth", "没有拿到 X 的访客令牌");
+  if (!json.guest_token) throw new SpaceError("auth", t("guestFailed"));
   return json.guest_token;
 }
 
@@ -95,7 +94,7 @@ async function firstOk(requests) {
       if (error.code === "query") throw error;
     }
   }
-  throw lastError || new SpaceError("http", "X 请求失败");
+  throw lastError || new SpaceError("http", t("apiFailedPlain"));
 }
 
 async function fetchAudioSpace(session, spaceId, queryId) {
@@ -122,9 +121,9 @@ async function fetchAudioSpace(session, spaceId, queryId) {
       .map((item) => item.message)
       .filter((message) => message && message.toLowerCase() !== "dependency: unspecified");
     if (messages.some((message) => /query|unknown operation/i.test(message))) {
-      throw new SpaceError("query", "Space 接口编号已失效");
+      throw new SpaceError("query", t("queryStale"));
     }
-    throw new SpaceError("missing", messages.join("；") || "找不到这场 Space");
+    throw new SpaceError("missing", messages.join("；") || t("spaceMissing"));
   }
   return space;
 }
@@ -136,17 +135,20 @@ async function fetchPlaylistUrl(session, mediaKey) {
   ]);
   const source = json.source || {};
   const playlistUrl = source.noRedirectPlaybackUrl || source.location || "";
-  if (!playlistUrl) throw new SpaceError("stream", "没有拿到回放地址");
-  if (playlistUrl.includes("/geoblocked/")) throw new SpaceError("geo", "这个回放在当前地区不可用");
+  if (!playlistUrl) throw new SpaceError("stream", t("noReplayUrl"));
+  if (playlistUrl.includes("/geoblocked/")) throw new SpaceError("geo", t("geoBlocked"));
   return playlistUrl;
 }
 
 function creatorOf(metadata) {
   const result = metadata.creator_results?.result || {};
-  const core = result.core || result.legacy || {};
+  const core = result.core || {};
+  const legacy = result.legacy || {};
+  const avatar = result.avatar?.image_url || legacy.profile_image_url_https || "";
   return {
-    creatorName: core.name || "",
-    handle: core.screen_name || "",
+    creatorName: core.name || legacy.name || "",
+    handle: core.screen_name || legacy.screen_name || "",
+    avatarUrl: avatar.replace(/_normal(\.\w+)$/, "_400x400$1"),
   };
 }
 
@@ -173,7 +175,7 @@ async function describePlaylists(playlistUrl) {
     const ready = master.endList && master.segments.length > 0;
     return {
       canDownload: ready,
-      message: ready ? "" : "回放还没有生成完整文件。若这场仍在直播，请等结束后再下载。",
+      message: ready ? "" : t("replayNotReady"),
       durationSeconds: master.durationSeconds,
       segmentCount: master.segments.length,
       mediaKind: kind,
@@ -187,7 +189,7 @@ async function describePlaylists(playlistUrl) {
 
   const audioTarget = selectPlaylistTarget(master, "audio");
   const videoTarget = selectPlaylistTarget(master, "video");
-  if (!audioTarget?.url) throw new SpaceError("playlist", "播放列表里没有音轨");
+  if (!audioTarget?.url) throw new SpaceError("playlist", t("playlistNoAudio"));
   const audio = await resolveMedia(audioTarget.url, "audio");
   const kind = mediaKind({ ...audio, codecs: audio.codecs || audioTarget.codecs });
   let videoMediaUrl = "";
@@ -200,12 +202,11 @@ async function describePlaylists(playlistUrl) {
     videoMediaUrl = audio.url;
   }
   const ready = audio.endList && audio.segments.length > 0;
-  const videoBytesEstimate = videoBandwidth && audio.durationSeconds
-    ? Math.round((videoBandwidth * audio.durationSeconds) / 8)
-    : 0;
+  const videoBytesEstimate =
+    videoBandwidth && audio.durationSeconds ? Math.round((videoBandwidth * audio.durationSeconds) / 8) : 0;
   return {
     canDownload: ready,
-    message: ready ? "" : "回放还没有生成完整文件。若这场仍在直播，请等结束后再下载。",
+    message: ready ? "" : t("replayNotReady"),
     durationSeconds: audio.durationSeconds,
     segmentCount: audio.segments.length,
     mediaKind: kind,
@@ -219,7 +220,7 @@ async function describePlaylists(playlistUrl) {
 
 export async function inspectSpace(spaceId, session, { queryId = DEFAULT_QUERY_ID } = {}) {
   if (!/^[0-9A-Za-z]{13,}$/.test(spaceId || "")) {
-    throw new SpaceError("url", "这不是 Space 链接");
+    throw new SpaceError("url", t("notSpaceUrl"));
   }
   const space = await fetchAudioSpace(session, spaceId, queryId);
   const metadata = space.metadata || {};
@@ -229,7 +230,7 @@ export async function inspectSpace(spaceId, session, { queryId = DEFAULT_QUERY_I
   const info = {
     spaceId,
     url: spacePageUrl(spaceId),
-    title: metadata.title || "未命名 Space",
+    title: metadata.title || t("untitled"),
     state: metadata.state || "",
     replay: Boolean(metadata.is_space_available_for_replay),
     contentType: metadata.content_type || "",
@@ -242,13 +243,13 @@ export async function inspectSpace(spaceId, session, { queryId = DEFAULT_QUERY_I
   };
 
   if (info.state === "NotStarted") {
-    info.message = "这场 Space 还没开始。";
+    info.message = t("notStarted");
     return info;
   }
   if (!info.mediaKey) {
-    if (info.state === "Running") info.message = "正在直播。完整录音要等这场结束，并且主持人保留了回放。";
-    else if (!info.replay) info.message = "这场 Space 已结束，主持人没有保留回放。";
-    else info.message = "回放还在生成，过几分钟再试。";
+    if (info.state === "Running") info.message = t("liveNow");
+    else if (!info.replay) info.message = t("noReplay");
+    else info.message = t("replayGenerating");
     return info;
   }
 
@@ -262,19 +263,6 @@ export async function inspectSpace(spaceId, session, { queryId = DEFAULT_QUERY_I
     info.message = wrapped.message;
     return info;
   }
-}
-
-export async function prepareDownload(spaceId, session, options = {}) {
-  const info = await inspectSpace(spaceId, session, options);
-  if (!info.canDownload) throw new SpaceError("unavailable", info.message || "没有可下载的录音");
-  const video = Boolean(options.video);
-  if (video && !info.videoAvailable) throw new SpaceError("video", "这场 Space 没有视频回放");
-  return {
-    ...presentable(info),
-    mediaUrl: video ? info.videoMediaUrl : info.audioMediaUrl,
-    mode: video ? "video" : "audio",
-    baseName: fileBase(info),
-  };
 }
 
 export function presentable(info) {
@@ -328,11 +316,12 @@ export async function discoverQueryId(scriptUrls = []) {
   const found = await searchScripts(rankScripts(scriptUrls));
   if (found) return found;
   try {
-    const response = await fetch("https://x.com/", { credentials: "omit" });
+    const response = await fetchWithTimeout("https://x.com/", { credentials: "omit" }, 10000);
     if (!response.ok) return null;
     const html = await response.text();
-    const urls = [...html.matchAll(/https:\/\/abs\.twimg\.com\/responsive-web\/client-web\/[^"'\\\s>]+\.js/g)]
-      .map((match) => match[0]);
+    const urls = [...html.matchAll(/https:\/\/abs\.twimg\.com\/responsive-web\/client-web\/[^"'\\\s>]+\.js/g)].map(
+      (match) => match[0],
+    );
     return searchScripts(rankScripts(urls));
   } catch {
     return null;

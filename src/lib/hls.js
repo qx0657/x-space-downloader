@@ -1,10 +1,12 @@
-import { concat } from "./bytes.js";
 import { asSpaceError, SpaceError } from "./errors.js";
-import { fetchWithTimeout } from "./net.js";
-import { createAacCollector } from "./m4a.js";
+import { t } from "./i18n.js";
+import { assertMediaUrl, fetchWithTimeout, retryableError, sleep } from "./net.js";
+import { createAacCollector, m4aHeader } from "./m4a.js";
+import { createMemoryStore } from "./store.js";
 import { extractAdtsFromTs } from "./ts-audio.js";
 
 const VIDEO_CODECS = /avc1|hev1|hvc1|vp09|vp9|av01/i;
+const MAX_SEGMENT_TRIES = 4;
 
 export function isAudioOnly(codecs = "") {
   return /mp4a|aac/i.test(codecs) && !VIDEO_CODECS.test(codecs);
@@ -23,9 +25,7 @@ function parseByteRange(value, previous) {
   if (!value) return null;
   const [lengthText, offsetText] = String(value).split("@");
   const length = Number(lengthText);
-  const offset = offsetText != null
-    ? Number(offsetText)
-    : (previous ? previous.offset + previous.length : 0);
+  const offset = offsetText != null ? Number(offsetText) : previous ? previous.offset + previous.length : 0;
   if (!Number.isFinite(length) || length < 0 || !Number.isFinite(offset) || offset < 0) return null;
   return { length, offset };
 }
@@ -160,26 +160,17 @@ export function parsePlaylist(text, playlistUrl) {
   };
 }
 
-function highest(list) {
-  return [...list].sort((a, b) => b.bandwidth - a.bandwidth)[0] || null;
-}
-
-function lowest(list) {
-  return [...list].sort((a, b) => a.bandwidth - b.bandwidth)[0] || null;
-}
+const highest = (list) => [...list].sort((a, b) => b.bandwidth - a.bandwidth)[0] || null;
+const lowest = (list) => [...list].sort((a, b) => a.bandwidth - b.bandwidth)[0] || null;
 
 export function selectPlaylistTarget(parsed, mode) {
   if (parsed.kind === "media") {
     return { url: parsed.url, bandwidth: parsed.bandwidth || 0, codecs: parsed.codecs || "", resolution: "" };
   }
   if (mode !== "video") {
-    const audio = parsed.renditions.find((item) => item.type === "AUDIO" && item.uri && (item.default || item.uri));
-    const preferred = parsed.renditions.find((item) => item.type === "AUDIO" && item.uri && item.default)
-      || parsed.renditions.find((item) => item.type === "AUDIO" && item.uri);
-    if (preferred || audio) {
-      const chosen = preferred || audio;
-      return { url: chosen.uri, bandwidth: 0, codecs: chosen.codecs || "mp4a", resolution: "" };
-    }
+    const audio = parsed.renditions.filter((item) => item.type === "AUDIO" && item.uri);
+    const chosen = audio.find((item) => item.default) || audio[0];
+    if (chosen) return { url: chosen.uri, bandwidth: 0, codecs: chosen.codecs || "mp4a", resolution: "" };
     const audioVariants = parsed.variants.filter((item) => isAudioOnly(item.codecs));
     if (audioVariants.length) return highest(audioVariants);
     return lowest(parsed.variants);
@@ -188,13 +179,12 @@ export function selectPlaylistTarget(parsed, mode) {
 }
 
 export async function fetchText(url, signal) {
-  assertHttpUrl(url);
-  const response = await fetchWithTimeout(url, {
-    signal,
-    credentials: "omit",
-    headers: { accept: "*/*", referer: "https://x.com/" },
-  });
-  if (!response.ok) throw new SpaceError("http", `打不开播放列表（${response.status}）`);
+  assertMediaUrl(url);
+  const response = await fetchWithTimeout(url, { signal, credentials: "omit", headers: { accept: "*/*" } });
+  if (response.status === 401 || response.status === 403) {
+    throw new SpaceError("expired", t("playlistHttp", response.status));
+  }
+  if (!response.ok) throw new SpaceError("http", t("playlistHttp", response.status));
   return response.text();
 }
 
@@ -206,12 +196,12 @@ export async function resolveMedia(entryUrl, mode, readText = fetchText) {
     const parsed = parsePlaylist(await readText(url), url);
     if (parsed.kind === "media") return { ...parsed, codecs, bandwidth };
     const target = selectPlaylistTarget(parsed, mode);
-    if (!target?.url) throw new SpaceError("playlist", "播放列表里没有可下载的音轨");
+    if (!target?.url) throw new SpaceError("playlist", t("playlistNoAudio"));
     url = target.url;
     codecs = target.codecs || codecs;
     bandwidth = target.bandwidth || bandwidth;
   }
-  throw new SpaceError("playlist", "播放列表嵌套异常");
+  throw new SpaceError("playlist", t("playlistNested"));
 }
 
 export function mediaKind(media) {
@@ -224,45 +214,30 @@ export function mediaKind(media) {
   return "unknown";
 }
 
-function assertHttpUrl(url) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new SpaceError("playlist", "播放地址不可用");
+async function fetchBytes(url, { signal, byterange } = {}) {
+  assertMediaUrl(url);
+  const headers = { accept: "*/*" };
+  if (byterange) headers.range = `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`;
+  const response = await fetchWithTimeout(url, { signal, credentials: "omit", headers });
+  if (response.status === 401 || response.status === 403) {
+    throw new SpaceError("expired", t("segmentHttp", response.status));
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new SpaceError("playlist", "播放地址不可用");
+  if (response.status === 429 || response.status >= 500) {
+    throw new SpaceError("retry", t("segmentHttp", response.status));
   }
+  if (!response.ok) throw new SpaceError("http", t("segmentHttp", response.status));
+  return new Uint8Array(await response.arrayBuffer());
 }
 
-async function fetchBytes(url, { signal, byterange }) {
-  assertHttpUrl(url);
-  const headers = { accept: "*/*", referer: "https://x.com/" };
-  if (byterange) {
-    const end = byterange.offset + byterange.length - 1;
-    headers.range = `bytes=${byterange.offset}-${end}`;
-  }
-  let lastError = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+async function fetchBytesWithRetry(url, options) {
+  for (let attempt = 1; ; attempt += 1) {
     try {
-      const response = await fetchWithTimeout(url, { signal, credentials: "omit", headers });
-      if (response.status === 404 || response.status === 403 || response.status === 401) {
-        throw new SpaceError("http", `分片下载失败（${response.status}）`);
-      }
-      if (response.status === 429 || response.status >= 500) {
-        throw new SpaceError("retry", `分片下载失败（${response.status}）`);
-      }
-      if (!response.ok) throw new SpaceError("http", `分片下载失败（${response.status}）`);
-      return new Uint8Array(await response.arrayBuffer());
+      return await fetchBytes(url, options);
     } catch (error) {
-      if (error?.name === "AbortError" || error?.code === "cancelled" || error?.code === "http" || error?.code === "playlist") throw error;
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      if (!retryableError(error) || attempt >= MAX_SEGMENT_TRIES) throw error;
+      await sleep(400 * attempt);
     }
   }
-  const code = lastError?.code === "timeout" || lastError?.code === "retry" ? lastError.code : "http";
-  throw new SpaceError(code, lastError?.message || "分片下载失败");
 }
 
 function sequenceIv(sequence) {
@@ -277,24 +252,25 @@ function sequenceIv(sequence) {
 
 async function decryptSegment(bytes, segment, keyCache, signal) {
   if (!segment.key || segment.key.method === "NONE") return bytes;
-  if (segment.key.method !== "AES-128") {
-    throw new SpaceError("encrypted", "这条回放的加密方式暂不支持");
-  }
+  if (segment.key.method !== "AES-128") throw new SpaceError("encrypted", t("encryptedUnsupported"));
   let key = keyCache.get(segment.key.uri);
   if (!key) {
-    const raw = await fetchBytes(segment.key.uri, { signal });
-    key = await crypto.subtle.importKey("raw", raw, { name: "AES-CBC" }, false, ["decrypt"]);
+    key = fetchBytesWithRetry(segment.key.uri, { signal }).then((raw) =>
+      crypto.subtle.importKey("raw", raw, { name: "AES-CBC" }, false, ["decrypt"]),
+    );
     keyCache.set(segment.key.uri, key);
+    key.catch(() => keyCache.delete(segment.key.uri));
   }
   const plain = await crypto.subtle.decrypt(
     { name: "AES-CBC", iv: segment.key.iv || sequenceIv(segment.sequence) },
-    key,
+    await key,
     bytes,
   );
   return new Uint8Array(plain);
 }
 
-function sniff(data) {
+export function sniff(data) {
+  if (!data) return "unknown";
   if (data.length >= 3 && data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) return "aac";
   if (data.length >= 2 && data[0] === 0xff && (data[1] & 0xf6) === 0xf0) return "aac";
   if (data.length >= 188 && data[0] === 0x47 && data.length % 188 === 0) return "ts";
@@ -308,11 +284,10 @@ function sniff(data) {
 function fmp4HasVideo(init, codecs) {
   if (VIDEO_CODECS.test(codecs || "")) return true;
   const head = init.subarray(0, Math.min(init.length, 8192));
-  const text = new TextDecoder("latin1").decode(head);
-  return /avc1|hvc1|hev1|vp09|av01/.test(text);
+  return /avc1|hvc1|hev1|vp09|av01/.test(new TextDecoder("latin1").decode(head));
 }
 
-export function deviceConcurrency(env = globalThis.navigator || {}) {
+export function deviceConcurrency(env = globalThis.navigator || {}, maxOverride = 0) {
   const cores = env.hardwareConcurrency || 4;
   const memory = env.deviceMemory || 4;
   const net = env.connection || {};
@@ -334,182 +309,259 @@ export function deviceConcurrency(env = globalThis.navigator || {}) {
     start = Math.max(start, 8);
     max = Math.max(max, 16);
   }
-  return { start: Math.max(2, Math.min(start, max)), min: 2, max };
+  if (maxOverride > 0) max = maxOverride;
+  const min = Math.min(2, max);
+  return { start: Math.max(min, Math.min(start, max)), min, max };
 }
 
-function retryableDownloadError(error) {
-  return error?.code === "timeout" || error?.code === "retry" || error?.code === "network";
-}
-
-async function adaptiveMap(items, fn, onTune) {
-  const limits = deviceConcurrency();
+// Runs `worker` over `items` with a concurrency limit that grows while responses are fast
+// and shrinks on slow or failed requests. Retryable failures go back to the queue; an
+// expired signature triggers one shared `refresh()` before the item is tried again.
+async function adaptiveMap(items, worker, { limits, onTune, refresh }) {
   let limit = limits.start;
-  const results = new Array(items.length);
-  const queue = items.map((item, index) => ({ item, index, tries: 0 }));
+  const queue = items.map((item) => ({ item, tries: 0, refreshed: false }));
   let inflight = 0;
+  let waiting = 0;
   let failure = null;
   const samples = [];
   let sinceBump = 0;
-  onTune?.({ concurrency: limit });
+  onTune?.(limit);
 
   await new Promise((resolve, reject) => {
+    const tune = (next) => {
+      if (next === limit) return;
+      limit = next;
+      sinceBump = 0;
+      onTune?.(limit);
+    };
+    const requeueLater = (job, ms, before = () => {}) => {
+      waiting += 1;
+      Promise.resolve()
+        .then(() => sleep(ms))
+        .then(before)
+        .then(
+          () => queue.unshift(job),
+          (error) => {
+            if (!failure) failure = error;
+          },
+        )
+        .finally(() => {
+          waiting -= 1;
+          pump();
+        });
+    };
     const pump = () => {
-      if (failure && inflight === 0) {
-        reject(failure);
+      if (failure) {
+        if (inflight === 0 && waiting === 0) reject(failure);
         return;
       }
-      if (!failure && queue.length === 0 && inflight === 0) {
+      if (queue.length === 0 && inflight === 0 && waiting === 0) {
         resolve();
         return;
       }
-      while (!failure && inflight < limit && queue.length > 0) {
+      while (inflight < limit && queue.length > 0) {
         const job = queue.shift();
         inflight += 1;
         const began = Date.now();
-        fn(job.item, job.index).then((value) => {
-          results[job.index] = value;
-          inflight -= 1;
-          const elapsed = Date.now() - began;
-          samples.push(elapsed);
-          if (samples.length > 8) samples.shift();
-          const average = samples.reduce((sum, value) => sum + value, 0) / samples.length;
-          sinceBump += 1;
-          if (sinceBump >= 6 && average < 700 && limit < limits.max) {
-            limit = Math.min(limits.max, limit + 2);
-            sinceBump = 0;
-            onTune?.({ concurrency: limit });
-          } else if (average > 2500 && limit > limits.min) {
-            limit -= 1;
-            sinceBump = 0;
-            onTune?.({ concurrency: limit });
-          }
-          pump();
-        }).catch((error) => {
-          inflight -= 1;
-          if (retryableDownloadError(error) && job.tries < 2) {
-            job.tries += 1;
-            queue.push(job);
-            limit = Math.max(limits.min, Math.floor(limit * 0.6));
-            sinceBump = 0;
-            onTune?.({ concurrency: limit });
+        worker(job.item).then(
+          () => {
+            inflight -= 1;
+            samples.push(Date.now() - began);
+            if (samples.length > 8) samples.shift();
+            const average = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+            sinceBump += 1;
+            if (sinceBump >= 6 && average < 700 && limit < limits.max) tune(Math.min(limits.max, limit + 2));
+            else if (average > 2500 && limit > limits.min) tune(limit - 1);
             pump();
-            return;
-          }
-          if (!failure) failure = error;
-          pump();
-        });
+          },
+          (error) => {
+            inflight -= 1;
+            if (error?.code === "expired" && refresh && !job.refreshed) {
+              job.refreshed = true;
+              requeueLater(job, 0, refresh);
+            } else if (retryableError(error) && job.tries < MAX_SEGMENT_TRIES - 1) {
+              job.tries += 1;
+              tune(Math.max(limits.min, Math.floor(limit * 0.6)));
+              requeueLater(job, 500 * job.tries);
+            } else if (!failure) {
+              failure = error;
+            }
+            pump();
+          },
+        );
       }
     };
     pump();
   });
-  return results;
 }
 
-async function mapPool(items, limit, fn) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  let failure = null;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (!failure) {
-      const index = cursor;
-      cursor += 1;
-      if (index >= items.length) return;
-      try {
-        results[index] = await fn(items[index], index);
-      } catch (error) {
-        if (!failure) failure = error;
-        return;
-      }
-    }
-  });
-  await Promise.all(workers);
-  if (failure) throw failure;
-  return results;
-}
-
-function resultFile(bytes, extension, mime, durationSeconds, segmentCount) {
-  return { bytes, extension, mime, durationSeconds, segmentCount };
-}
-
-async function assemble(media, segments, { mode, signal, onProgress }) {
-  const total = segments.length;
-  let completed = 0;
-  let lanes = deviceConcurrency().start;
-  let detected = media.map ? "fmp4" : "";
-  const keyCache = new Map();
-  const pieces = await adaptiveMap(segments, async (segment, index) => {
-    onProgress?.({ phase: "segment", completed, total, active: index + 1, concurrency: lanes });
-    let bytes = await fetchBytes(segment.url, { signal, byterange: segment.byterange });
-    bytes = await decryptSegment(bytes, segment, keyCache, signal);
-    const kind = sniff(bytes);
-    if (!detected) detected = kind;
-    if (mode !== "video" && kind === "ts") bytes = extractAdtsFromTs(bytes);
-    completed += 1;
-    onProgress?.({ phase: "segment", completed, total, active: index + 1, concurrency: lanes });
-    return bytes;
-  }, (tune) => {
-    if (tune.concurrency) lanes = tune.concurrency;
-    onProgress?.({ phase: "segment", completed, total, concurrency: lanes });
-  });
-  onProgress?.({ phase: "mux", completed: total, total });
-  const durationSeconds = segments.reduce((sum, segment) => sum + segment.duration, 0);
-
-  if (mode === "video") {
-    if (detected === "aac") {
-      const muxed = muxAacPieces(pieces);
-      return resultFile(muxed.bytes, "m4a", "audio/x-m4a", muxed.durationSeconds, total);
-    }
-    if (detected === "fmp4") {
-      const bytes = await concatFragmented(media, pieces, signal);
-      return resultFile(bytes, "mp4", "video/mp4", durationSeconds, total);
-    }
-    return resultFile(concat(pieces), "ts", "video/mp2t", durationSeconds, total);
+function segmentName(url) {
+  try {
+    return new URL(url).pathname.split("/").pop();
+  } catch {
+    return "";
   }
-
-  if (detected === "aac" || detected === "ts") {
-    const muxed = muxAacPieces(pieces);
-    return resultFile(muxed.bytes, "m4a", "audio/x-m4a", muxed.durationSeconds, total);
-  }
-  if (detected === "fmp4") {
-    const init = media.map
-      ? await fetchBytes(media.map.url, { signal, byterange: media.map.byterange })
-      : new Uint8Array(0);
-    if (fmp4HasVideo(init.length ? init : pieces[0], media.codecs)) {
-      throw new SpaceError("video", "这条回放是视频分段，请改用下载视频");
-    }
-    const bytes = concat(init.length ? [init, ...pieces] : pieces);
-    return resultFile(bytes, "m4a", "audio/x-m4a", durationSeconds, total);
-  }
-  throw new SpaceError("audio", "认不出回放的音频格式");
-}
-
-function muxAacPieces(pieces) {
-  const collector = createAacCollector();
-  for (const piece of pieces) collector.push(piece);
-  return collector.finish();
-}
-
-async function concatFragmented(media, pieces, signal) {
-  if (!media.map) return concat(pieces);
-  const init = await fetchBytes(media.map.url, { signal, byterange: media.map.byterange });
-  return concat([init, ...pieces]);
 }
 
 export async function downloadRecording(entryUrl, options = {}) {
-  const { mode = "audio", signal, onProgress, maxSegments = Infinity } = options;
+  const {
+    mode = "audio",
+    signal,
+    onProgress,
+    maxSegments = Infinity,
+    store = createMemoryStore(),
+    refreshMedia,
+    metadata = null,
+    createRemuxer = null,
+    limits = deviceConcurrency(),
+  } = options;
   try {
     onProgress?.({ phase: "playlist", completed: 0, total: 0 });
-    const media = await resolveMedia(entryUrl, mode, (url) => fetchText(url, signal));
-    if (!media.endList) {
-      throw new SpaceError("live", "回放还没有生成完整文件。若这场仍在直播，请等结束后再下载。");
-    }
-    if (!media.segments.length) throw new SpaceError("empty", "播放列表是空的");
-    if (media.segments.length > 20000) throw new SpaceError("playlist", "播放列表异常地长，已停止");
-    const limit = Number.isFinite(maxSegments) ? Math.max(0, maxSegments) : media.segments.length;
-    const segments = media.segments.slice(0, limit);
-    if (!segments.length) throw new SpaceError("empty", "没有可下载的音频分片");
-    return await assemble(media, segments, { mode, signal, onProgress });
+    const readText = (url) => fetchText(url, signal);
+    const media = await resolveMedia(entryUrl, mode, readText);
+    if (!media.endList) throw new SpaceError("live", t("replayNotReady"));
+    if (!media.segments.length) throw new SpaceError("empty", t("playlistEmpty"));
+    if (media.segments.length > 20000) throw new SpaceError("playlist", t("playlistTooLong"));
+    const count = Number.isFinite(maxSegments) ? Math.max(0, maxSegments) : media.segments.length;
+    const segments = media.segments.slice(0, count).map((segment) => ({ ...segment }));
+    if (!segments.length) throw new SpaceError("empty", t("noSegments"));
+    const total = segments.length;
+
+    await store.prepare({
+      mode,
+      total,
+      first: segmentName(segments[0].url),
+      last: segmentName(segments[total - 1].url),
+    });
+    const done = await store.completed();
+    let completed = done.size;
+    let lanes = limits.start;
+    const report = () => onProgress?.({ phase: "segment", completed, total, concurrency: lanes });
+    report();
+
+    let refreshing = null;
+    const refresh = refreshMedia
+      ? () => {
+          refreshing ||= (async () => {
+            const fresh = await resolveMedia(await refreshMedia(), mode, readText);
+            if (fresh.segments.length < total) throw new SpaceError("playlist", t("playlistChanged"));
+            segments.forEach((segment, index) => {
+              segment.url = fresh.segments[index].url;
+              segment.key = fresh.segments[index].key;
+            });
+            if (fresh.map) media.map = fresh.map;
+          })();
+          return refreshing;
+        }
+      : null;
+
+    const keyCache = new Map();
+    const missing = segments.map((_, index) => index).filter((index) => !done.has(index));
+    await adaptiveMap(
+      missing,
+      async (index) => {
+        const segment = segments[index];
+        let bytes = await fetchBytes(segment.url, { signal, byterange: segment.byterange });
+        bytes = await decryptSegment(bytes, segment, keyCache, signal);
+        if (mode !== "video" && sniff(bytes) === "ts") bytes = extractAdtsFromTs(bytes);
+        await store.put(index, bytes);
+        completed += 1;
+        report();
+      },
+      {
+        limits,
+        refresh,
+        onTune: (limit) => {
+          lanes = limit;
+          report();
+        },
+      },
+    );
+
+    const durationSeconds = segments.reduce((sum, segment) => sum + segment.duration, 0);
+    return await assemble({ media, total, store, mode, signal, onProgress, metadata, createRemuxer, durationSeconds });
   } catch (error) {
     throw asSpaceError(error);
   }
+}
+
+async function segmentFiles(store, total) {
+  const files = [];
+  for (let i = 0; i < total; i += 1) files.push(await store.segmentFile(i));
+  return files;
+}
+
+async function assembleAac({ store, total, onProgress, metadata, signal }) {
+  const collector = createAacCollector();
+  const writer = await store.writer("body");
+  try {
+    for (let i = 0; i < total; i += 1) {
+      if (signal?.aborted) throw new SpaceError("cancelled", t("cancelled"));
+      const raw = collector.push(await store.get(i));
+      if (raw) await writer.write(raw);
+      onProgress?.({ phase: "mux", completed: i + 1, total });
+    }
+  } finally {
+    await writer.close();
+  }
+  const summary = collector.finish();
+  const blob = new Blob([m4aHeader(summary, metadata), await store.file("body")], {
+    type: "application/octet-stream",
+  });
+  return { blob, extension: "m4a", mime: "audio/mp4", durationSeconds: summary.durationSeconds, segmentCount: total };
+}
+
+async function remuxTs({ store, total, onProgress, signal, createRemuxer }) {
+  const remuxer = createRemuxer();
+  const writer = await store.writer("video");
+  try {
+    for (let i = 0; i < total; i += 1) {
+      if (signal?.aborted) throw new SpaceError("cancelled", t("cancelled"));
+      for (const piece of remuxer.push(await store.get(i))) await writer.write(piece);
+      onProgress?.({ phase: "mux", completed: i + 1, total });
+    }
+  } finally {
+    await writer.close();
+  }
+  if (!remuxer.init) throw new SpaceError("video", t("remuxFailed"));
+  return new Blob([remuxer.init, await store.file("video")], { type: "video/mp4" });
+}
+
+async function assemble({ media, total, store, mode, signal, onProgress, metadata, createRemuxer, durationSeconds }) {
+  onProgress?.({ phase: "mux", completed: 0, total });
+  const detected = media.map ? "fmp4" : sniff(await store.get(0));
+
+  if (detected === "aac" || (detected === "ts" && mode !== "video")) {
+    return assembleAac({ store, total, onProgress, metadata, signal });
+  }
+
+  if (detected === "ts") {
+    if (createRemuxer) {
+      try {
+        const blob = await remuxTs({ store, total, onProgress, signal, createRemuxer });
+        return { blob, extension: "mp4", mime: "video/mp4", durationSeconds, segmentCount: total };
+      } catch (error) {
+        if (error?.code === "cancelled") throw error;
+      }
+    }
+    const blob = new Blob(await segmentFiles(store, total), { type: "video/mp2t" });
+    return { blob, extension: "ts", mime: "video/mp2t", durationSeconds, segmentCount: total };
+  }
+
+  if (detected === "fmp4") {
+    const init = media.map
+      ? await fetchBytesWithRetry(media.map.url, { signal, byterange: media.map.byterange })
+      : new Uint8Array(0);
+    const files = await segmentFiles(store, total);
+    if (mode !== "video") {
+      const probe = init.length ? init : await store.get(0);
+      if (fmp4HasVideo(probe, media.codecs)) throw new SpaceError("video", t("useVideoDownload"));
+      const blob = new Blob([init, ...files], { type: "application/octet-stream" });
+      return { blob, extension: "m4a", mime: "audio/mp4", durationSeconds, segmentCount: total };
+    }
+    const blob = new Blob([init, ...files], { type: "video/mp4" });
+    return { blob, extension: "mp4", mime: "video/mp4", durationSeconds, segmentCount: total };
+  }
+
+  throw new SpaceError("audio", t("unknownAudioFormat"));
 }

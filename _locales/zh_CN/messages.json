@@ -1,0 +1,5 @@
+{
+  "extName": { "message": "X Space 录音下载" },
+  "extDescription": { "message": "解析 X Space 回放，并把录音下载为音频文件。" },
+  "actionTitle": { "message": "下载 X Space 录音" }
+}

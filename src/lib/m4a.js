@@ -1,16 +1,19 @@
 import { SpaceError } from "./errors.js";
+import { t } from "./i18n.js";
 import { ascii, box, concat, u16, u32 } from "./bytes.js";
 
 const SAMPLE_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 const AAC_SAMPLES_PER_FRAME = 1024;
+const EMPTY = new Uint8Array(0);
 
 function id3TagLength(buffer, offset) {
   if (offset + 10 > buffer.length) return null;
   if (buffer[offset] !== 0x49 || buffer[offset + 1] !== 0x44 || buffer[offset + 2] !== 0x33) return 0;
-  const size = ((buffer[offset + 6] & 0x7f) << 21)
-    | ((buffer[offset + 7] & 0x7f) << 14)
-    | ((buffer[offset + 8] & 0x7f) << 7)
-    | (buffer[offset + 9] & 0x7f);
+  const size =
+    ((buffer[offset + 6] & 0x7f) << 21) |
+    ((buffer[offset + 7] & 0x7f) << 14) |
+    ((buffer[offset + 8] & 0x7f) << 7) |
+    (buffer[offset + 9] & 0x7f);
   if (size > 1_000_000) return 10;
   const total = 10 + size;
   if (offset + total > buffer.length) return null;
@@ -24,9 +27,8 @@ function readAdts(buffer, offset) {
   const profile = (buffer[offset + 2] >> 6) & 0x03;
   const sampleRateIndex = (buffer[offset + 2] >> 2) & 0x0f;
   const channels = ((buffer[offset + 2] & 0x01) << 2) | ((buffer[offset + 3] >> 6) & 0x03);
-  const frameLength = ((buffer[offset + 3] & 0x03) << 11)
-    | (buffer[offset + 4] << 3)
-    | ((buffer[offset + 5] >> 5) & 0x07);
+  const frameLength =
+    ((buffer[offset + 3] & 0x03) << 11) | (buffer[offset + 4] << 3) | ((buffer[offset + 5] >> 5) & 0x07);
   const headerLength = protectionAbsent ? 7 : 9;
   if (sampleRateIndex >= SAMPLE_RATES.length || frameLength < headerLength + 1 || frameLength > 8191) {
     return { sync: false };
@@ -37,18 +39,17 @@ function readAdts(buffer, offset) {
     profile,
     sampleRateIndex,
     channels,
-    headerLength,
+    raw: buffer.subarray(offset + headerLength, offset + frameLength),
     frameLength,
-    raw: buffer.slice(offset + headerLength, offset + frameLength),
   };
 }
 
 // Space 的 .aac 分片前面带有 Apple 的 ID3 时间戳，后面才是 ADTS。
-// 这里丢掉标签和 ADTS 头，只留下能放进 m4a 的裸 AAC。
+// push() 丢掉标签和 ADTS 头，返回能放进 m4a 的裸 AAC；只在内存里保留每帧长度。
 export function createAacCollector() {
-  let pending = new Uint8Array(0);
-  const rawParts = [];
+  let pending = EMPTY;
   const lengths = [];
+  let rawLength = 0;
   let profile = null;
   let sampleRateIndex = null;
   let channels = null;
@@ -58,19 +59,18 @@ export function createAacCollector() {
       profile = frame.profile;
       sampleRateIndex = frame.sampleRateIndex;
       channels = frame.channels;
-      if (!channels) {
-        throw new SpaceError("audio", "音频声道信息不完整，没法封装成 m4a");
-      }
+      if (!channels) throw new SpaceError("audio", t("aacNoChannels"));
     } else if (frame.sampleRateIndex !== sampleRateIndex || frame.channels !== channels) {
-      throw new SpaceError("audio", "录音中途换了采样率或声道，没法合成一个文件");
+      throw new SpaceError("audio", t("aacFormatChanged"));
     }
     lengths.push(frame.raw.length);
+    rawLength += frame.raw.length;
     return frame.raw;
   }
 
   return {
     push(chunk) {
-      if (!chunk?.length && !pending.length) return;
+      if (!chunk?.length && !pending.length) return null;
       const buffer = pending.length ? concat([pending, chunk]) : chunk;
       const pieces = [];
       let offset = 0;
@@ -90,15 +90,23 @@ export function createAacCollector() {
         pieces.push(remember(frame));
         offset += frame.frameLength;
       }
-      if (pieces.length) rawParts.push(concat(pieces));
-      pending = offset < buffer.length ? buffer.slice(offset) : new Uint8Array(0);
-      if (pending.length > 1_000_000) {
-        throw new SpaceError("audio", "有一段音频对不上 AAC 帧，下载已停止");
-      }
+      pending = offset < buffer.length ? buffer.slice(offset) : EMPTY;
+      if (pending.length > 1_000_000) throw new SpaceError("audio", t("aacUnaligned"));
+      return pieces.length ? concat(pieces) : null;
     },
     finish() {
-      if (!lengths.length) throw new SpaceError("audio", "没有解析出音频帧");
-      return muxAac(rawParts, lengths, { profile, sampleRateIndex, channels });
+      if (!lengths.length) throw new SpaceError("audio", t("aacNoFrames"));
+      const sampleRate = SAMPLE_RATES[sampleRateIndex];
+      return {
+        lengths,
+        rawLength,
+        profile,
+        sampleRateIndex,
+        sampleRate,
+        channels,
+        frameCount: lengths.length,
+        durationSeconds: (lengths.length * AAC_SAMPLES_PER_FRAME) / sampleRate,
+      };
     },
     get frameCount() {
       return lengths.length;
@@ -115,18 +123,16 @@ function audioSpecificConfig(profile, sampleRateIndex, channels) {
 }
 
 function descriptor(tag, body) {
-  if (body.length >= 128) throw new SpaceError("audio", "音频描述块超出预期");
+  if (body.length >= 128) throw new SpaceError("audio", t("aacDescriptor"));
   return concat([new Uint8Array([tag, body.length]), body]);
 }
 
 function esds(config, bitrate) {
   const specific = descriptor(0x05, config);
-  const decoder = descriptor(0x04, concat([
-    new Uint8Array([0x40, 0x15, 0x00, 0x18, 0x00]),
-    u32(bitrate),
-    u32(bitrate),
-    specific,
-  ]));
+  const decoder = descriptor(
+    0x04,
+    concat([new Uint8Array([0x40, 0x15, 0x00, 0x18, 0x00]), u32(bitrate), u32(bitrate), specific]),
+  );
   const syncLayer = descriptor(0x06, new Uint8Array([0x02]));
   const es = descriptor(0x03, concat([u16(1), new Uint8Array([0x00]), decoder, syncLayer]));
   return box("esds", u32(0), es);
@@ -137,6 +143,7 @@ function mp4Time() {
 }
 
 function matrix() {
+  // prettier-ignore
   return concat([
     u32(0x00010000), u32(0), u32(0),
     u32(0), u32(0x00010000), u32(0),
@@ -144,69 +151,62 @@ function matrix() {
   ]);
 }
 
-function buildMoov({ frameCount, timescale, sampleRate, channels, config, bitrate, mdatOffset }) {
+const utf8 = (value) => new TextEncoder().encode(String(value));
+
+function textItem(name, value) {
+  if (!value) return null;
+  return box(name, box("data", u32(1), u32(0), utf8(value)));
+}
+
+function coverItem(cover) {
+  if (!cover?.bytes?.length) return null;
+  return box("covr", box("data", u32(cover.type === "png" ? 14 : 13), u32(0), cover.bytes));
+}
+
+export function metadataBox(metadata) {
+  if (!metadata) return null;
+  const items = [
+    textItem("\xa9nam", metadata.title),
+    textItem("\xa9ART", metadata.artist),
+    textItem("aART", metadata.artist),
+    textItem("\xa9alb", metadata.album),
+    textItem("\xa9day", metadata.date),
+    textItem("\xa9cmt", metadata.comment),
+    coverItem(metadata.cover),
+  ].filter(Boolean);
+  if (!items.length) return null;
+  const hdlr = box("hdlr", u32(0), u32(0), ascii("mdir"), ascii("appl"), u32(0), u32(0), new Uint8Array(1));
+  return box("udta", box("meta", u32(0), hdlr, box("ilst", ...items)));
+}
+
+function buildMoov({ lengths, sampleRate, channels, config, bitrate, mdatOffset, udta }) {
+  const frameCount = lengths.length;
   const duration = frameCount * AAC_SAMPLES_PER_FRAME;
   const now = mp4Time();
+  // prettier-ignore
   const mvhd = box("mvhd", concat([
-    u32(0),
-    u32(now),
-    u32(now),
-    u32(timescale),
-    u32(duration),
-    u32(0x00010000),
-    u16(0x0100),
-    u16(0),
-    u32(0),
-    u32(0),
+    u32(0), u32(now), u32(now), u32(sampleRate), u32(duration),
+    u32(0x00010000), u16(0x0100), u16(0), u32(0), u32(0),
     matrix(),
     u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
     u32(2),
   ]));
+  // prettier-ignore
   const tkhd = box("tkhd", concat([
-    u32(0x00000007),
-    u32(now),
-    u32(now),
-    u32(1),
-    u32(0),
-    u32(duration),
-    u32(0),
-    u32(0),
-    u16(0),
-    u16(0),
-    u16(0x0100),
-    u16(0),
+    u32(0x00000007), u32(now), u32(now), u32(1), u32(0), u32(duration),
+    u32(0), u32(0), u16(0), u16(0), u16(0x0100), u16(0),
     matrix(),
-    u32(0),
-    u32(0),
+    u32(0), u32(0),
   ]));
-  const mdhd = box("mdhd", concat([
-    u32(0),
-    u32(now),
-    u32(now),
-    u32(timescale),
-    u32(duration),
-    u16(0x55c4),
-    u16(0),
-  ]));
-  const name = concat([ascii("SoundHandler"), new Uint8Array(1)]);
-  const hdlr = box("hdlr", concat([
-    u32(0),
-    u32(0),
-    ascii("soun"),
-    u32(0), u32(0), u32(0),
-    name,
-  ]));
+  const mdhd = box("mdhd", concat([u32(0), u32(now), u32(now), u32(sampleRate), u32(duration), u16(0x55c4), u16(0)]));
+  const hdlr = box(
+    "hdlr",
+    concat([u32(0), u32(0), ascii("soun"), u32(0), u32(0), u32(0), ascii("SoundHandler"), new Uint8Array(1)]),
+  );
+  // prettier-ignore
   const mp4a = box("mp4a", concat([
-    new Uint8Array(6),
-    u16(1),
-    u16(0),
-    u16(0),
-    u32(0),
-    u16(channels),
-    u16(16),
-    u16(0),
-    u16(0),
-    u32(sampleRate << 16),
+    new Uint8Array(6), u16(1), u16(0), u16(0), u32(0),
+    u16(channels), u16(16), u16(0), u16(0), u32(sampleRate << 16),
     esds(config, bitrate),
   ]));
   const stsd = box("stsd", concat([u32(0), u32(1), mp4a]));
@@ -214,86 +214,44 @@ function buildMoov({ frameCount, timescale, sampleRate, channels, config, bitrat
   const stsc = box("stsc", concat([u32(0), u32(1), u32(1), u32(frameCount), u32(1)]));
   const stszBody = new Uint8Array(12 + frameCount * 4);
   const view = new DataView(stszBody.buffer);
-  view.setUint32(4, 0);
   view.setUint32(8, frameCount);
+  for (let i = 0; i < frameCount; i += 1) view.setUint32(12 + i * 4, lengths[i]);
   const stsz = box("stsz", stszBody);
   const stco = box("stco", concat([u32(0), u32(1), u32(mdatOffset)]));
   const stbl = box("stbl", stsd, stts, stsc, stsz, stco);
   const smhd = box("smhd", concat([u32(0), u16(0), u16(0)]));
   const dref = box("dref", concat([u32(0), u32(1), box("url ", u32(1))]));
   const minf = box("minf", smhd, box("dinf", dref), stbl);
-  const mdia = box("mdia", mdhd, hdlr, minf);
-  const trak = box("trak", tkhd, mdia);
-  return { moov: box("moov", mvhd, trak), stsz, stszBody };
+  const trak = box("trak", tkhd, box("mdia", mdhd, hdlr, minf));
+  return udta ? box("moov", mvhd, trak, udta) : box("moov", mvhd, trak);
 }
 
-function findBytes(haystack, needle, end) {
-  const last = Math.min(haystack.length, end) - needle.length;
-  for (let i = 0; i <= last; i += 1) {
-    if (haystack[i] !== needle[0]) continue;
-    let matched = true;
-    for (let j = 1; j < needle.length; j += 1) {
-      if (haystack[i + j] !== needle[j]) {
-        matched = false;
-        break;
-      }
-    }
-    if (matched) return i;
-  }
-  return -1;
-}
-
-function writeSampleSizes(file, moovLength, frameCount, lengths) {
-  const stszSize = 20 + frameCount * 4;
-  const needle = concat([u32(stszSize), ascii("stsz"), u32(0), u32(0), u32(frameCount)]);
-  const found = findBytes(file, needle, moovLength + 64);
-  if (found < 0) throw new SpaceError("audio", "封装 m4a 时没有写上采样表");
-  const view = new DataView(file.buffer, file.byteOffset + found + needle.length, lengths.length * 4);
-  for (let i = 0; i < lengths.length; i += 1) view.setUint32(i * 4, lengths[i]);
-}
-
-export function muxAac(rawParts, lengths, info) {
-  const sampleRate = SAMPLE_RATES[info.sampleRateIndex];
-  const raw = concat(rawParts);
-  const bitrate = Math.max(1, Math.round((raw.length * 8 * sampleRate) / (lengths.length * AAC_SAMPLES_PER_FRAME)));
-  const config = audioSpecificConfig(info.profile, info.sampleRateIndex, info.channels);
-  const ftyp = box("ftyp", ascii("M4A "), u32(0), ascii("M4A "), ascii("isom"));
-  const draft = buildMoov({
-    frameCount: lengths.length,
-    timescale: sampleRate,
+// ftyp + moov + mdat 头。真正的 AAC 数据由调用方紧接着拼在后面。
+export function m4aHeader(summary, metadata = null) {
+  const { lengths, rawLength, sampleRate, channels, profile, sampleRateIndex } = summary;
+  if (rawLength + 8 > 0xffffffff) throw new SpaceError("audio", t("aacTooLarge"));
+  const bitrate = Math.max(1, Math.round((rawLength * 8 * sampleRate) / (lengths.length * AAC_SAMPLES_PER_FRAME)));
+  const base = {
+    lengths,
     sampleRate,
-    channels: info.channels,
-    config,
+    channels,
+    config: audioSpecificConfig(profile, sampleRateIndex, channels),
     bitrate,
-    mdatOffset: 0,
-  });
-  const mdatHeader = 8;
-  const mdatOffset = ftyp.length + draft.moov.length + mdatHeader;
-  if (raw.length + mdatHeader > 0xffffffff) {
-    throw new SpaceError("audio", "录音超过 4GB，没法存成一个文件");
-  }
-  const finalMoov = buildMoov({
-    frameCount: lengths.length,
-    timescale: sampleRate,
-    sampleRate,
-    channels: info.channels,
-    config,
-    bitrate,
-    mdatOffset,
-  });
-  const file = concat([
-    ftyp,
-    finalMoov.moov,
-    u32(raw.length + mdatHeader),
-    ascii("mdat"),
-    raw,
-  ]);
-  writeSampleSizes(file, ftyp.length + finalMoov.moov.length, lengths.length, lengths);
-  return {
-    bytes: file,
-    sampleRate,
-    channels: info.channels,
-    frameCount: lengths.length,
-    durationSeconds: (lengths.length * AAC_SAMPLES_PER_FRAME) / sampleRate,
+    udta: metadataBox(metadata),
   };
+  const ftyp = box("ftyp", ascii("M4A "), u32(0), ascii("M4A "), ascii("isom"));
+  const draft = buildMoov({ ...base, mdatOffset: 0 });
+  const moov = buildMoov({ ...base, mdatOffset: ftyp.length + draft.length + 8 });
+  return concat([ftyp, moov, u32(rawLength + 8), ascii("mdat")]);
+}
+
+export function muxAacChunks(chunks, metadata = null) {
+  const collector = createAacCollector();
+  const raws = [];
+  for (const chunk of chunks) {
+    const raw = collector.push(chunk);
+    if (raw) raws.push(raw);
+  }
+  const summary = collector.finish();
+  return { ...summary, bytes: concat([m4aHeader(summary, metadata), ...raws]) };
 }
