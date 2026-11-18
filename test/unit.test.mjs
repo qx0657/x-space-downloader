@@ -12,6 +12,7 @@ import { nextJob } from "../src/lib/job.js";
 import { createAacCollector, m4aHeader, muxAacChunks } from "../src/lib/m4a.js";
 import { isAllowedMediaUrl } from "../src/lib/net.js";
 import { normalizeSettings } from "../src/lib/settings.js";
+import { createSpeakerLog, rosterFromSpace } from "../src/lib/speakers.js";
 import { spaceIdFromText } from "../src/lib/space-url.js";
 import { createMemoryStore } from "../src/lib/store.js";
 import { extractAdtsFromTs } from "../src/lib/ts-audio.js";
@@ -106,6 +107,8 @@ test("normalises settings", () => {
   assert.equal(s.videoFormat, "mp4");
   assert.equal(s.template, "{date} {handle} {title}");
   assert.equal(s.showPanel, false);
+  assert.equal(s.saveSpeakers, true);
+  assert.equal(normalizeSettings({ saveSpeakers: false }).saveSpeakers, false);
 });
 
 test("zh and en dictionaries have the same keys", () => {
@@ -190,6 +193,113 @@ test("parses byte ranges, keys, map and media sequence", () => {
 });
 
 // ---------- m4a ----------
+
+function txxx(key, value) {
+  const payload = new TextEncoder().encode(`${key}\0${value}\0`);
+  const body = concat([new Uint8Array([3]), payload]);
+  const header = new Uint8Array(10);
+  header.set([0x54, 0x58, 0x58, 0x58]);
+  header[4] = (body.length >> 21) & 0x7f;
+  header[5] = (body.length >> 14) & 0x7f;
+  header[6] = (body.length >> 7) & 0x7f;
+  header[7] = body.length & 0x7f;
+  return concat([header, body]);
+}
+
+function hydraTag({ participants, levels = [] }) {
+  const frames = [];
+  if (participants) frames.push(txxx("HydraParticipants", JSON.stringify(participants)));
+  for (const level of levels) frames.push(txxx("HydraAudioLevel", JSON.stringify(level)));
+  return id3Wrap(concat(frames));
+}
+
+test("reports the AAC frame count when an ID3 tag is skipped, including a tag split across chunks", () => {
+  const seen = [];
+  const collector = createAacCollector({ onTag: (_tag, frameCount) => seen.push(frameCount) });
+  const first = hydraTag({ levels: [[1]] });
+  collector.push(first.subarray(0, 8));
+  assert.deepEqual(seen, []);
+  const frames = [];
+  for (let i = 0; i < 15; i += 1) frames.push(makeAdts(8));
+  collector.push(concat([first.subarray(8), ...frames, hydraTag({ levels: [[2]] })]));
+  assert.deepEqual(seen, [0, 15]);
+  assert.equal(collector.finish().frameCount, 15);
+});
+
+test("builds a speaker timeline from interleaved Hydra tags", () => {
+  const participants = [
+    { UserName: "Alice", UserId: "tw-2" },
+    { UserName: "bob", UserId: "tw-3" },
+  ];
+  const roster = {
+    host: { id: "tw-1", handle: "hostuser", name: "主持人" },
+    people: [
+      { id: "tw-2", handle: "alice", name: "Alice", role: "speaker" },
+      { id: "tw-3", handle: "bob", name: "Bob", role: "speaker" },
+    ],
+  };
+  const log = createSpeakerLog();
+  log.observe(
+    hydraTag({
+      participants,
+      levels: [
+        [0, 80, 0],
+        [0, 70, 0],
+      ],
+    }),
+    0,
+  );
+  log.observe(hydraTag({ levels: [[0, 10, 0]] }), 30);
+  log.observe(hydraTag({ levels: [[90, 0, 0]] }), 45);
+  log.observe(hydraTag({ levels: [[88, 0, 0]] }), 60);
+  log.observe(hydraTag({ levels: [[0, 0, 60]] }), 120);
+  log.observe(hydraTag({ levels: [[1, 2, 3, 4]] }), 150);
+  const doc = log.finish({
+    sampleRate: 48000,
+    durationSeconds: 4,
+    roster,
+    space: { id: "abc", title: "Weekly", startedAt: Date.UTC(2026, 10, 17, 12) },
+  });
+  assert.equal(doc.version, 1);
+  assert.equal(doc.space.host.handle, "hostuser");
+  assert.equal(doc.space.startedAt, "2026-11-17T12:00:00.000Z");
+  assert.equal(doc.audio.unmappedSamples, 1);
+  assert.deepEqual(
+    doc.turns.map((turn) => turn.speaker),
+    ["alice", "hostuser"],
+  );
+  const alice = doc.turns[0];
+  assert.equal(alice.start, 0);
+  assert.equal(alice.peak, 80);
+  assert.ok(alice.end > alice.start);
+  assert.equal(doc.speakers[0].name, "Alice");
+  assert.equal(doc.speakers[0].id, "tw-2");
+  assert.equal(doc.speakers.find((person) => person.handle === "hostuser").role, "host");
+  assert.equal(
+    doc.speakers.find((person) => person.handle === "bob"),
+    undefined,
+  );
+  assert.equal(doc.raw.samples[0][1].alice, 80);
+  assert.ok(doc.raw.samples.some((sample) => sample[1].bob === 60));
+});
+
+test("reads the Space roster into host and speakers", () => {
+  const roster = rosterFromSpace({
+    metadata: { creator_results: { result: { rest_id: "9", core: { screen_name: "hostuser", name: "主持人" } } } },
+    participants: {
+      admins: [{ twitter_screen_name: "hostuser", display_name: "主持人", user_results: { rest_id: "9" } }],
+      speakers: [
+        { twitter_screen_name: "alice", display_name: "Alice", user_results: { rest_id: "2" } },
+        { twitter_screen_name: "alice", display_name: "重复", user_results: { rest_id: "2" } },
+      ],
+    },
+  });
+  assert.deepEqual(roster.host, { id: "tw-9", handle: "hostuser", name: "主持人" });
+  assert.deepEqual(roster.people, [
+    { id: "tw-9", handle: "hostuser", name: "主持人", role: "admin" },
+    { id: "tw-2", handle: "alice", name: "Alice", role: "speaker" },
+  ]);
+});
 
 test("muxes AAC frames that begin with an ID3 tag, across chunk boundaries", () => {
   const collector = createAacCollector();

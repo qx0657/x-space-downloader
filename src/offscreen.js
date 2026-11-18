@@ -75,6 +75,7 @@ async function start(prepared) {
       signal: controller.signal,
       store,
       metadata,
+      speakers: prepared.speakers || null,
       limits: deviceConcurrency(navigator, prepared.maxConcurrency),
       createRemuxer: prepared.videoFormat === "mp4" && Transmuxer ? () => createTsRemuxer(Transmuxer) : null,
       refreshMedia: () => refreshMedia(prepared.runId),
@@ -82,11 +83,15 @@ async function start(prepared) {
     });
     report.stop();
     const url = URL.createObjectURL(file.blob);
-    finished.set(prepared.runId, { url, storeKey: prepared.storeKey });
+    const speakersUrl = file.speakers
+      ? URL.createObjectURL(new Blob([JSON.stringify(file.speakers)], { type: "application/json" }))
+      : "";
+    finished.set(prepared.runId, { url, speakersUrl, storeKey: prepared.storeKey });
     await send({
       type: "offscreen-file",
       runId: prepared.runId,
       url,
+      speakersUrl,
       extension: file.extension,
       durationSeconds: file.durationSeconds,
       segmentCount: file.segmentCount,
@@ -101,13 +106,35 @@ async function start(prepared) {
   }
 }
 
+function revoke(entry, kind) {
+  const key = kind === "speakers" ? "speakersUrl" : "url";
+  if (!entry?.[key]) return;
+  URL.revokeObjectURL(entry[key]);
+  entry[key] = "";
+}
+
+function isHolding(entry) {
+  return Boolean(entry?.url || entry?.speakersUrl);
+}
+
+// 录音文件和发言人 JSON 是两次浏览器下载，各自下完才释放对应的 blob。
 async function finishRun(runId, success) {
   const entry = finished.get(runId);
-  if (entry) {
-    URL.revokeObjectURL(entry.url);
-    finished.delete(runId);
-    if (success) await removeOpfsStore(entry.storeKey);
-  }
+  if (!entry) return { holding: false };
+  entry.settled = true;
+  revoke(entry, "audio");
+  if (!success) revoke(entry, "speakers");
+  if (success) await removeOpfsStore(entry.storeKey);
+  if (!isHolding(entry)) finished.delete(runId);
+  return { holding: isHolding(finished.get(runId)) };
+}
+
+function releaseBlob(runId, kind) {
+  const entry = finished.get(runId);
+  if (!entry) return { holding: false };
+  revoke(entry, kind);
+  if (entry.settled && !isHolding(entry)) finished.delete(runId);
+  return { holding: isHolding(finished.get(runId)) };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -130,10 +157,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return false;
     case "finish-run":
       finishRun(message.runId, Boolean(message.success)).then(
-        () => sendResponse({ ok: true }),
-        () => sendResponse({ ok: false }),
+        (result) => sendResponse({ ok: true, holding: Boolean(result?.holding) }),
+        () => sendResponse({ ok: false, holding: true }),
       );
       return true;
+    case "release-blob":
+      sendResponse({ ok: true, ...releaseBlob(message.runId, message.kind) });
+      return false;
     default:
       return false;
   }

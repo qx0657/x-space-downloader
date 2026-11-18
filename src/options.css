@@ -49,11 +49,16 @@ label > span {
 label.check {
   display: flex;
   gap: 8px;
-  align-items: center;
+  align-items: flex-start;
+}
+
+label.check input {
+  margin-top: 4px;
 }
 
 label.check > span {
   font-weight: 400;
+  min-width: 0;
 }
 
 input[type="text"],

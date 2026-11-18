@@ -4,6 +4,7 @@ import { epochMs } from "./format.js";
 import { apiLanguage, t } from "./i18n.js";
 import { fetchText, isAudioOnly, mediaKind, parsePlaylist, resolveMedia, selectPlaylistTarget } from "./hls.js";
 import { spacePageUrl } from "./space-url.js";
+import { rosterFromSpace } from "./speakers.js";
 
 // x.com 网页自己带的公开客户端令牌，不是用户密钥。
 // 登录身份只来自浏览器里的 auth_token / ct0。
@@ -236,6 +237,7 @@ export async function inspectSpace(spaceId, session, { queryId = DEFAULT_QUERY_I
     contentType: metadata.content_type || "",
     mediaKey: metadata.media_key || "",
     ...creatorOf(metadata),
+    roster: rosterFromSpace(space),
     startedAt,
     endedAt,
     ...emptyPlayback(),

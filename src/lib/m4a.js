@@ -44,9 +44,10 @@ function readAdts(buffer, offset) {
   };
 }
 
-// Space 的 .aac 分片前面带有 Apple 的 ID3 时间戳，后面才是 ADTS。
+// Space 的 .aac 分片里，ID3 标签和 ADTS 帧交替出现。
 // push() 丢掉标签和 ADTS 头，返回能放进 m4a 的裸 AAC；只在内存里保留每帧长度。
-export function createAacCollector() {
+// onTag(tag, frameCount) 在丢掉标签前回调，frameCount 是这段标签之前已经收下的 AAC 帧数。
+export function createAacCollector({ onTag } = {}) {
   let pending = EMPTY;
   const lengths = [];
   let rawLength = 0;
@@ -78,6 +79,7 @@ export function createAacCollector() {
         const tagLength = id3TagLength(buffer, offset);
         if (tagLength == null) break;
         if (tagLength > 0) {
+          onTag?.(buffer.subarray(offset, offset + tagLength), lengths.length);
           offset += tagLength;
           continue;
         }

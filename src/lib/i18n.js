@@ -117,6 +117,7 @@ const zh = {
   optConcurrency: "最大并发连接数",
   optConcurrencyHint: "0 表示按设备和网络自动调整。",
   optMetadata: "在音频文件里写入标题、主持人、日期和封面",
+  optSpeakers: "同时保存发言人时间线（.speakers.json），记录谁在什么时间说话",
   optShowPanel: "在 Space 页面右下角显示下载面板",
   optSaved: "已保存",
 };
@@ -236,6 +237,7 @@ const en = {
   optConcurrency: "Maximum parallel connections",
   optConcurrencyHint: "0 adjusts automatically for your device and network.",
   optMetadata: "Write title, host, date and cover art into audio files",
+  optSpeakers: "Also save a speaker timeline (.speakers.json) showing who talked when",
   optShowPanel: "Show the download panel on Space pages",
   optSaved: "Saved",
 };

@@ -2,6 +2,7 @@ import { asSpaceError, SpaceError } from "./errors.js";
 import { t } from "./i18n.js";
 import { assertMediaUrl, fetchWithTimeout, retryableError, sleep } from "./net.js";
 import { createAacCollector, m4aHeader } from "./m4a.js";
+import { createSpeakerLog } from "./speakers.js";
 import { createMemoryStore } from "./store.js";
 import { extractAdtsFromTs } from "./ts-audio.js";
 
@@ -414,6 +415,7 @@ export async function downloadRecording(entryUrl, options = {}) {
     metadata = null,
     createRemuxer = null,
     limits = deviceConcurrency(),
+    speakers = null,
   } = options;
   try {
     onProgress?.({ phase: "playlist", completed: 0, total: 0 });
@@ -479,7 +481,18 @@ export async function downloadRecording(entryUrl, options = {}) {
     );
 
     const durationSeconds = segments.reduce((sum, segment) => sum + segment.duration, 0);
-    return await assemble({ media, total, store, mode, signal, onProgress, metadata, createRemuxer, durationSeconds });
+    return await assemble({
+      media,
+      total,
+      store,
+      mode,
+      signal,
+      onProgress,
+      metadata,
+      createRemuxer,
+      durationSeconds,
+      speakers,
+    });
   } catch (error) {
     throw asSpaceError(error);
   }
@@ -491,8 +504,11 @@ async function segmentFiles(store, total) {
   return files;
 }
 
-async function assembleAac({ store, total, onProgress, metadata, signal }) {
-  const collector = createAacCollector();
+async function assembleAac({ store, total, onProgress, metadata, signal, speakers }) {
+  const speakerLog = speakers ? createSpeakerLog() : null;
+  const collector = createAacCollector({
+    onTag: speakerLog ? (tag, frameCount) => speakerLog.observe(tag, frameCount) : null,
+  });
   const writer = await store.writer("body");
   try {
     for (let i = 0; i < total; i += 1) {
@@ -508,7 +524,22 @@ async function assembleAac({ store, total, onProgress, metadata, signal }) {
   const blob = new Blob([m4aHeader(summary, metadata), await store.file("body")], {
     type: "application/octet-stream",
   });
-  return { blob, extension: "m4a", mime: "audio/mp4", durationSeconds: summary.durationSeconds, segmentCount: total };
+  const timeline = speakerLog
+    ? speakerLog.finish({
+        sampleRate: summary.sampleRate,
+        durationSeconds: summary.durationSeconds,
+        roster: speakers.roster,
+        space: { ...speakers.space, durationSeconds: summary.durationSeconds },
+      })
+    : null;
+  return {
+    blob,
+    extension: "m4a",
+    mime: "audio/mp4",
+    durationSeconds: summary.durationSeconds,
+    segmentCount: total,
+    speakers: timeline,
+  };
 }
 
 async function remuxTs({ store, total, onProgress, signal, createRemuxer }) {
@@ -527,12 +558,23 @@ async function remuxTs({ store, total, onProgress, signal, createRemuxer }) {
   return new Blob([remuxer.init, await store.file("video")], { type: "video/mp4" });
 }
 
-async function assemble({ media, total, store, mode, signal, onProgress, metadata, createRemuxer, durationSeconds }) {
+async function assemble({
+  media,
+  total,
+  store,
+  mode,
+  signal,
+  onProgress,
+  metadata,
+  createRemuxer,
+  durationSeconds,
+  speakers,
+}) {
   onProgress?.({ phase: "mux", completed: 0, total });
   const detected = media.map ? "fmp4" : sniff(await store.get(0));
 
   if (detected === "aac" || (detected === "ts" && mode !== "video")) {
-    return assembleAac({ store, total, onProgress, metadata, signal });
+    return assembleAac({ store, total, onProgress, metadata, signal, speakers });
   }
 
   if (detected === "ts") {

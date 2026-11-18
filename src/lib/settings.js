@@ -7,6 +7,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   maxConcurrency: 0,
   videoFormat: "mp4",
   embedMetadata: true,
+  saveSpeakers: true,
 });
 
 export function normalizeSettings(raw = {}) {
@@ -19,6 +20,7 @@ export function normalizeSettings(raw = {}) {
     maxConcurrency: Number.isFinite(concurrency) ? Math.max(0, Math.min(32, concurrency)) : 0,
     videoFormat: value.videoFormat === "ts" ? "ts" : "mp4",
     embedMetadata: value.embedMetadata !== false,
+    saveSpeakers: value.saveSpeakers !== false,
   };
 }
 

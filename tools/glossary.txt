@@ -1,0 +1,18 @@
+# 转写术语表：纠正专有名词，也会作为热词提示给 FunASR。
+#
+# 每行写一个词：正确写法: 常被听成的写法1, 写法2, ...
+# 只写正确写法、不带冒号时，只作为热词，不做替换。
+# 英文写法不分大小写，按整词匹配，词与词之间有没有空格都算。
+# 某场 Space 专用的词，可以写在录音旁边的「<同名>.glossary.txt」里，会和这里合并。
+#
+# 替换是机械的：像 cloud、global 这种本身也是常用词的写法，确认不会误伤再加进来。
+
+WayToBot: way to boat, where to boat, way to bot, v to ball, we to ball, V2BOT, V2BO, 未突破, 微突破
+Grok: 胡萝卜, 萝卜卜, 萝卜, ggloball, gooloball, gglobal
+Muse: gmuse, gnews
+Claude
+OpenAI: open AR
+Personal Agent: personalaron, personal a人, ssonal agent
+Space: SBS, CBS
+Codex
+Manus

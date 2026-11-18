@@ -177,8 +177,14 @@ async function closeOffscreen() {
 
 async function finishRun(runId, success) {
   if (!(await offscreenOpen())) return;
-  await sendMessageTimeout({ type: "finish-run", runId, success }, 10000).catch(() => {});
-  if (success) await closeOffscreen();
+  const response = await sendMessageTimeout({ type: "finish-run", runId, success }, 10000).catch(() => null);
+  if (!response?.holding) await closeOffscreen();
+}
+
+async function releaseBlob(runId, kind) {
+  if (!(await offscreenOpen())) return;
+  const response = await sendMessageTimeout({ type: "release-blob", runId, kind }, 10000).catch(() => null);
+  if (!response?.holding) await closeOffscreen();
 }
 
 // ---------- 任务 ----------
@@ -264,6 +270,26 @@ function metadataFor(info) {
   };
 }
 
+function speakerSource(info) {
+  return {
+    roster: {
+      host: {
+        id: info.roster?.host?.id || "",
+        handle: info.roster?.host?.handle || info.handle || "",
+        name: info.roster?.host?.name || info.creatorName || "",
+      },
+      people: info.roster?.people || [],
+    },
+    space: {
+      id: info.spaceId,
+      url: info.url || spacePageUrl(info.spaceId),
+      title: info.title || "",
+      startedAt: info.startedAt || null,
+      endedAt: info.endedAt || null,
+    },
+  };
+}
+
 async function startDownload(message) {
   const spaceId = requireSpaceId(message.url);
   const video = Boolean(message.video);
@@ -287,6 +313,14 @@ async function startDownload(message) {
       mediaUrl = video ? fresh.videoMediaUrl : fresh.audioMediaUrl;
     }
     if (video && !info.videoAvailable) throw new SpaceError("video", t("noVideo"));
+    if (settings.saveSpeakers && !video && !info.roster) {
+      try {
+        const fresh = await inspectWithSession(spaceId, message.scriptUrls);
+        info = { ...info, roster: fresh.roster };
+      } catch {
+        // 名单没拿到时，时间线里仍有音频分片记录的账号。
+      }
+    }
     if (!mediaUrl) throw new SpaceError("unavailable", t("noReplayUrl"));
     if (!isAllowedMediaUrl(mediaUrl)) throw new SpaceError("playlist", t("mediaUrlRejected"));
 
@@ -300,6 +334,7 @@ async function startDownload(message) {
       phase: "downloading",
       runId,
       downloadId: null,
+      speakersDownloadId: null,
       spaceId,
       url: spacePageUrl(spaceId),
       mode,
@@ -323,6 +358,7 @@ async function startDownload(message) {
           maxConcurrency: settings.maxConcurrency,
           videoFormat: settings.videoFormat,
           metadata: settings.embedMetadata && mode === "audio" ? metadataFor(info) : null,
+          speakers: settings.saveSpeakers && mode === "audio" ? speakerSource(info) : null,
         },
       },
       5000,
@@ -364,13 +400,39 @@ async function onOffscreenProgress({ runId, progress }) {
   await publishJob(patch);
 }
 
+const speakerDownloads = new Map();
+
+async function rememberSpeakersDownload(runId, downloadId) {
+  if (!downloadId) return null;
+  speakerDownloads.set(downloadId, runId);
+  const [item] = await chrome.downloads.search({ id: downloadId });
+  if (item && item.state !== "in_progress") {
+    speakerDownloads.delete(downloadId);
+    await releaseBlob(runId, "speakers");
+    return null;
+  }
+  return downloadId;
+}
+
 async function onOffscreenFile(message) {
   const job = await readJob();
   if (job?.runId !== message.runId || job.phase !== "downloading") {
     await finishRun(message.runId, false);
     return;
   }
+  let speakersDownloadId = null;
   try {
+    if (message.speakersUrl) {
+      speakersDownloadId = await rememberSpeakersDownload(
+        job.runId,
+        await chrome.downloads.download({
+          url: message.speakersUrl,
+          filename: `${job.target || fileBase(job)}.speakers.json`,
+          conflictAction: "uniquify",
+          saveAs: false,
+        }),
+      );
+    }
     const downloadId = await chrome.downloads.download({
       url: message.url,
       filename: `${job.target || fileBase(job)}.${message.extension}`,
@@ -380,12 +442,17 @@ async function onOffscreenFile(message) {
     await publishJob({
       runId: job.runId,
       downloadId,
+      speakersDownloadId,
       message: t("savingFile"),
       completed: message.segmentCount,
       total: message.segmentCount,
       durationSeconds: message.durationSeconds || job.durationSeconds,
     });
   } catch (error) {
+    if (speakersDownloadId) {
+      speakerDownloads.delete(speakersDownloadId);
+      await chrome.downloads.cancel(speakersDownloadId).catch(() => {});
+    }
     await publishJob({ runId: job.runId, phase: "error", message: asSpaceError(error).message });
     await finishRun(job.runId, false);
   }
@@ -411,6 +478,14 @@ async function onOffscreenRefresh(message) {
 
 chrome.downloads.onChanged.addListener(async (delta) => {
   if (!delta.state) return;
+  const speakerRunId = speakerDownloads.get(delta.id);
+  if (speakerRunId) {
+    if (delta.state.current === "complete" || delta.state.current === "interrupted") {
+      speakerDownloads.delete(delta.id);
+      await releaseBlob(speakerRunId, "speakers");
+    }
+    return;
+  }
   const job = await readJob();
   if (!job?.downloadId || job.downloadId !== delta.id || job.phase !== "downloading") return;
   if (delta.state.current === "complete") {
@@ -451,6 +526,10 @@ async function cancel() {
   if (job?.phase !== "downloading") return { ok: true, job };
   await sendMessageTimeout({ type: "download-cancel", runId: job.runId }).catch(() => {});
   if (job.downloadId) await chrome.downloads.cancel(job.downloadId).catch(() => {});
+  if (job.speakersDownloadId) {
+    speakerDownloads.delete(job.speakersDownloadId);
+    await chrome.downloads.cancel(job.speakersDownloadId).catch(() => {});
+  }
   const next = await publishJob({ runId: job.runId, phase: "cancelled", message: t("cancelledDownload") });
   return { ok: true, job: next };
 }

@@ -2,6 +2,15 @@
 
 本项目的所有显著变更均记录在此文件中。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- 下载音频时同时保存 `.speakers.json`，记录每位发言人（X 账号和昵称）在什么时间说话，可在设置中关闭。
+- 新增命令行 `tools/download.mjs`：公开 Space 无需登录即可下载录音和发言人时间线。
+- 新增 `tools/transcribe.py`：用本机 FunASR 把录音转成带发言人的中文文字稿，并用术语表纠正专有名词。
+- 新增 Agent Skill `skills/x-space-transcript`：给定 Space 链接后下载、转写，并整理成摘要、按人观点、关键原话和待办。
+
 ## [1.1.0] - 2026-11-17
 
 ### 新增

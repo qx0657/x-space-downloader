@@ -27,6 +27,21 @@
 
 公开 Space 回放无需登录即可解析下载（扩展会自动申请 X 访客令牌）；仅登录可见或受限的回放，请先在当前 Chrome 中登录拥有访问权限的 `x.com` 账号。
 
+## 命令行、转写与 AI 总结
+
+公开 Space 不需要浏览器，命令行就能下载，并转写成带发言人的文字稿：
+
+```bash
+node tools/download.mjs https://x.com/i/spaces/<id>      # 得到 .m4a 和 .speakers.json
+uv run tools/transcribe.py "<录音>.m4a"                  # 得到 .transcript.md 和 .transcript.json
+```
+
+- `.speakers.json` 来自回放分片里的 Hydra 音量数据，记录每位发言人（X 账号和昵称）在什么时间说话。扩展下载时也会保存这个文件，可在设置里关闭。
+- 转写默认用 FunASR 中文模型，模型缓存在 `~/AI-Services/models/modelscope`；英文 Space 可加 `--engine whisper`（需 `uv run --with mlx-whisper`）。
+- 专有名词靠术语表纠正：全局的写在 `tools/glossary.txt`，某一场专用的写在录音旁边的 `<同名>.glossary.txt`。
+
+`skills/x-space-transcript/` 是配套的 Agent Skill：给 AI 一个 Space 链接，它会依次下载、转写，再整理出摘要、按发言人的观点、带时间点的关键原话，以及提到的工具、链接和待办。
+
 ## 设置项说明
 
 在弹窗底部点击“设置”，或在 `chrome://extensions` 的扩展详情中打开扩展选项即可修改以下配置（实时保存在 `chrome.storage.sync`）：

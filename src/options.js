@@ -22,6 +22,7 @@ function read() {
     videoFormat: form.videoFormat.value,
     maxConcurrency: Number(form.maxConcurrency.value) || 0,
     embedMetadata: form.embedMetadata.checked,
+    saveSpeakers: form.saveSpeakers.checked,
     showPanel: form.showPanel.checked,
   };
 }
@@ -32,6 +33,7 @@ function fill(settings) {
   form.videoFormat.value = settings.videoFormat;
   form.maxConcurrency.value = String(settings.maxConcurrency);
   form.embedMetadata.checked = settings.embedMetadata;
+  form.saveSpeakers.checked = settings.saveSpeakers;
   form.showPanel.checked = settings.showPanel;
   updatePreview(settings);
 }
